@@ -1158,9 +1158,12 @@ dependencies = [
  "notify",
  "patina-apps",
  "patina-ui",
+ "raw-window-handle",
  "serde",
  "toml",
  "trash",
+ "wayland-backend",
+ "wayland-client",
  "zbus",
 ]
 

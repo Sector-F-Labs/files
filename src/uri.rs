@@ -63,6 +63,12 @@ pub fn clipboard_files(text: &str) -> (Vec<PathBuf>, bool) {
     (paths, cut)
 }
 
+/// `paths` as a `text/uri-list`, as a drag hands them to another app:
+/// one URI a line, each ended with CR LF (RFC 2483).
+pub fn drag_list(paths: &[PathBuf]) -> String {
+    paths.iter().map(|p| from_path(p) + "\r\n").collect()
+}
+
 /// What Files puts on the clipboard: Nautilus's form, so Nautilus pastes it.
 pub fn clipboard_text(paths: &[PathBuf], cut: bool) -> String {
     let mut text = format!("x-special/nautilus-clipboard\n{}\n", if cut { "cut" } else { "copy" });
@@ -76,6 +82,12 @@ pub fn clipboard_text(paths: &[PathBuf], cut: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drag_list_has_a_crlf_line_per_file() {
+        let list = drag_list(&[PathBuf::from("/home/a/b c.png"), PathBuf::from("/tmp/x")]);
+        assert_eq!(list, "file:///home/a/b%20c.png\r\nfile:///tmp/x\r\n");
+    }
 
     #[test]
     fn uris_and_paths_round_trip() {

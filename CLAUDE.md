@@ -37,6 +37,9 @@ lost). `pgrep -f` matches your own shell: find processes with `pgrep -x files`.
   each request runs `files --choose` (a process per dialog: one winit loop per process).
   `src/chooser.rs`: the request and answer (TOML over stdin/stdout), filters and globs.
   Picking mode in `app.rs` is `Files::picking`: no menus or tabs, the chooser bar, `accept`.
+- `src/drag_out.rs`: drags as Wayland drags (ADR-0006), on a second connection onto winit's
+  display with its own queue and thread; `Over` events bring the drag back to egui over Files'
+  own window.
 - `src/places.rs`, `src/watch.rs` (notify), `src/uri.rs` (file URIs, the clipboard's form),
   `src/config.rs` (`~/.config/files/config.toml`), `src/glyphs.rs` (painted toolbar symbols).
 

@@ -40,6 +40,8 @@ struct Queue {
 
 pub struct Icons {
     textures: HashMap<Key, Option<TextureHandle>>,
+    /// The same, as pixels: a drag's icon shows one at once (ADR-0006).
+    images: HashMap<Key, Arc<ColorImage>>,
     queue: Arc<Queue>,
     done: Receiver<(Key, Option<ColorImage>)>,
 }
@@ -52,16 +54,24 @@ impl Icons {
         let worker = queue.clone();
         let ctx = ctx.clone();
         std::thread::Builder::new().name("icons".into()).spawn(move || work(&worker, &theme, &send, &ctx)).ok();
-        Icons { textures: HashMap::new(), queue, done }
+        Icons { textures: HashMap::new(), images: HashMap::new(), queue, done }
     }
 
     /// Takes in what the thread has finished.
     pub fn poll(&mut self, ctx: &egui::Context) {
         while let Ok((key, image)) = self.done.try_recv() {
             let name = format!("icon-{}", self.textures.len());
+            if let Some(i) = &image {
+                self.images.insert(key.clone(), Arc::new(i.clone()));
+            }
             let texture = image.map(|i| ctx.load_texture(name, i, TextureOptions::LINEAR));
             self.textures.insert(key, texture);
         }
+    }
+
+    /// The largest picture of `source` drawn so far.
+    pub fn drawn(&self, source: &Source) -> Option<Arc<ColorImage>> {
+        self.images.iter().filter(|((s, _), _)| s == source).max_by_key(|((_, px), _)| *px).map(|(_, i)| i.clone())
     }
 
     /// The texture for `source` at `px` pixels, if it's ready; asks for it
@@ -97,6 +107,12 @@ fn work(queue: &Queue, theme: &str, send: &Sender<(Key, Option<ColorImage>)>, ct
         }
         ctx.request_repaint();
     }
+}
+
+/// `source` drawn at `px` pixels, there and then: for the icon a drag
+/// out of the window shows, on a thread of its own.
+pub fn image(source: &Source, px: u32) -> Option<ColorImage> {
+    draw(source, px, &icon_theme())
 }
 
 fn draw(source: &Source, px: u32, theme: &str) -> Option<ColorImage> {

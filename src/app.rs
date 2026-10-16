@@ -20,6 +20,7 @@ use patina::tabs::{self, TabAction, TabStrip};
 
 use crate::chooser::{Answer, Filter, Request};
 use crate::config::{Config, View};
+use crate::drag_out::Over;
 use crate::glyphs::{self, Glyph};
 use crate::icons::{self, Icons, Source};
 use crate::listing::{self, Entry, Kind, Listed, Location, SortBy};
@@ -253,6 +254,12 @@ enum Action {
 }
 
 pub struct Files {
+    /// Drags out of the window, to other apps, on Wayland (ADR-0006).
+    drag_out: Option<crate::drag_out::DragOut>,
+    /// The files egui is dragging are a Wayland drag too.
+    dragging_out: bool,
+    /// And it was dropped on our own window.
+    dropped_here: bool,
     config: Config,
     skins: Vec<Skin>,
     skin: usize,
@@ -360,7 +367,17 @@ impl Files {
             .collect();
         special.remove(Path::new("/"));
 
+        let drag_out = {
+            use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+            match (cc.display_handle(), cc.window_handle()) {
+                (Ok(d), Ok(w)) => crate::drag_out::DragOut::new(ctx, d.as_raw(), w.as_raw()),
+                _ => None,
+            }
+        };
         let mut files = Files {
+            drag_out,
+            dragging_out: false,
+            dropped_here: false,
             config,
             skins,
             skin,
@@ -2358,8 +2375,69 @@ impl Files {
         visible.iter().position(|&i| tab.entries[i].path == path)
     }
 
+    /// Files being dragged become a Wayland drag, so whatever app is under
+    /// the pointer when they're let go can take them (ADR-0006).
+    fn drag_out(&mut self, ctx: &egui::Context) {
+        let Some(out) = &self.drag_out else { return };
+        if self.dragging_out {
+            return;
+        }
+        let Some(dragged) = DragAndDrop::payload::<Dragged>(ctx) else { return };
+        let source = self
+            .current()
+            .entries
+            .iter()
+            .find(|e| Some(&e.path) == dragged.0.first())
+            .map(|e| self.icon_source(e))
+            .unwrap_or_else(|| icons::theme(&["text-x-generic"]));
+        // The icon already on screen if there is one, rather than decoding
+        // a big picture again while the drag waits.
+        let drawn = self.icons.drawn(&source);
+        self.dragging_out = out.start(&dragged.0, ctx.pixels_per_point(), move |px| {
+            drawn.map(|i| (*i).clone()).or_else(|| icons::image(&source, px))
+        });
+    }
+
+    /// Our Wayland drag over our own window, as the pointer egui no longer
+    /// gets while the compositor has it: moves, and a release where it was
+    /// dropped, or well away when it went elsewhere.
+    fn drag_over(&mut self, raw_input: &mut egui::RawInput) {
+        let Some(out) = &self.drag_out else { return };
+        let release = |pos: egui::Pos2, modifiers| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers,
+        };
+        for over in out.over() {
+            match over {
+                Over::Moved(pos) => raw_input.events.push(egui::Event::PointerMoved(pos)),
+                Over::Left => raw_input.events.push(egui::Event::PointerGone),
+                Over::Dropped(pos) => {
+                    raw_input.events.push(egui::Event::PointerMoved(pos));
+                    raw_input.events.push(release(pos, raw_input.modifiers));
+                    self.dropped_here = true;
+                }
+                Over::Ended => {
+                    if !self.dropped_here {
+                        let away = egui::pos2(-1.0e4, -1.0e4);
+                        raw_input.events.push(egui::Event::PointerMoved(away));
+                        raw_input.events.push(release(away, raw_input.modifiers));
+                        raw_input.events.push(egui::Event::PointerGone);
+                    }
+                    self.dragging_out = false;
+                    self.dropped_here = false;
+                }
+            }
+        }
+    }
+
     /// What's being dragged, drawn beside the pointer.
     fn drag_ghost(&self, ctx: &egui::Context) {
+        // The compositor draws a Wayland drag's icon.
+        if self.dragging_out {
+            return;
+        }
         let Some(dragged) = DragAndDrop::payload::<Dragged>(ctx) else { return };
         let Some(pointer) = ctx.pointer_interact_pos() else { return };
         let text = match &dragged.0[..] {
@@ -2597,6 +2675,7 @@ impl eframe::App for Files {
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(4)))
             .show(ui, |ui| self.items(ui));
 
+        self.drag_out(&ctx);
         self.drag_ghost(&ctx);
         self.dialogs(&ctx);
         for action in std::mem::take(&mut self.actions) {
@@ -2615,6 +2694,7 @@ impl eframe::App for Files {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         frame::release_grab(ctx, raw_input);
+        self.drag_over(raw_input);
         patina::ime::drop_repeated_preedits(ctx, raw_input);
     }
 

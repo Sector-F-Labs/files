@@ -18,7 +18,10 @@ libc = "0.2"
 notify = "7"
 patina-apps = { git = "https://github.com/Sector-F-Labs/patina-apps", features = ["icon"] }
 patina-ui = "0.1.9"
+raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 trash = "5.2.9"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
 zbus = "5"
