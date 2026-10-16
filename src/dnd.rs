@@ -1,10 +1,16 @@
-//! Dragging files out of the window into other apps (ADR-0006). A drag of
-//! files is a Wayland drag from the start, offering them as
-//! `text/uri-list` with their icon under the pointer, so any window can
-//! take them, even one lying over Files. While it's over Files' own window,
-//! the compositor's drag events come back as `Over`s, which the app gives
-//! egui as pointer events, so its own drops (into folders, onto places)
-//! work as before.
+//! Drag and drop with other apps, and other Files windows, on Wayland.
+//!
+//! Out (ADR-0006): a drag of files is a Wayland drag from the start,
+//! offering them as `text/uri-list` with their icon under the pointer, so
+//! any window can take them.
+//!
+//! In (ADR-0007): a drag of files from another app is taken over Files'
+//! window, its list read as soon as it comes over, so egui has the paths to
+//! drag before it's let go.
+//!
+//! Either way, while a drag is over Files' window its events come back as
+//! `Over`s, which the app gives egui as pointer events, so its drops (into
+//! folders, onto places) are egui's own, as inside one window.
 //!
 //! winit can't start a Wayland drag, so this opens a connection of its own
 //! onto winit's display, as smithay-clipboard does for the clipboard: its
@@ -16,6 +22,7 @@ use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use egui::ColorImage;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -43,14 +50,39 @@ const URI_LIST: &str = "text/uri-list";
 pub const ICON: u32 = 64;
 const HOTSPOT: i32 = 20;
 
-/// Our drag, over our own window, in its points.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// How long a drop waits for the other app to say which files it holds.
+const READ_WAIT: Duration = Duration::from_secs(2);
+
+/// A drag over our window, in its points.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Over {
+    /// Another app's drag has come over, holding these files.
+    Incoming(Vec<PathBuf>),
     Moved(egui::Pos2),
     Left,
-    Dropped(egui::Pos2),
-    /// It's over, wherever it was dropped, or it was called off.
+    /// Let go here; `copy` if the drop is a copy (Ctrl), not a move.
+    Dropped {
+        at: egui::Pos2,
+        copy: bool,
+    },
+    /// Our own drag is over, wherever it was dropped, or it was called off.
     Ended,
+}
+
+/// What an offer holds and the action chosen for it, as the compositor
+/// tells us.
+#[derive(Default)]
+struct OfferInfo {
+    types: Mutex<Vec<String>>,
+    action: Mutex<Option<DndAction>>,
+}
+
+/// A drag over our window: its offer, whether it's ours, and for another
+/// app's, word when its files have been read.
+struct Hover {
+    offer: WlDataOffer,
+    own: bool,
+    read: Option<Receiver<()>>,
 }
 
 /// What the thread and the window share.
@@ -65,7 +97,7 @@ struct Shared {
     icon: Option<WlSurface>,
 }
 
-pub struct DragOut {
+pub struct Dnd {
     conn: Connection,
     qh: QueueHandle<State>,
     shared: Arc<Mutex<Shared>>,
@@ -77,7 +109,7 @@ pub struct DragOut {
     over: Receiver<Over>,
 }
 
-impl DragOut {
+impl Dnd {
     /// Onto the window's Wayland connection; `None` elsewhere (X11), or if
     /// the compositor lacks something. `ctx` is woken for each `Over`.
     pub fn new(ctx: &egui::Context, display: RawDisplayHandle, window: RawWindowHandle) -> Option<Self> {
@@ -107,7 +139,7 @@ impl DragOut {
             shared: shared.clone(),
             pointer: None,
             window: window.clone(),
-            offer: None,
+            hover: None,
             at: egui::Pos2::ZERO,
             over: send,
             ctx: ctx.clone(),
@@ -124,7 +156,7 @@ impl DragOut {
         self.shared.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// What our drag did over our window since last asked.
+    /// What drags did over our window since last asked.
     pub fn over(&self) -> Vec<Over> {
         self.over.try_iter().collect()
     }
@@ -146,7 +178,9 @@ impl DragOut {
         let list: Arc<[u8]> = crate::uri::drag_list(paths).into_bytes().into();
         let source = self.manager.create_data_source(&self.qh, list);
         source.offer(URI_LIST.into());
-        source.set_actions(DndAction::Copy);
+        // Move too, for other Files windows, which move the files
+        // themselves; a drag out never deletes anything here.
+        source.set_actions(DndAction::Copy | DndAction::Move);
         let surface = self.compositor.create_surface(&self.qh, ());
         device.start_drag(Some(&source), &self.window, Some(&surface), serial);
         shared.dragging = true;
@@ -200,14 +234,41 @@ fn shared_memory(bytes: &[u8]) -> Option<OwnedFd> {
     Some(file.into())
 }
 
+/// The files in a `text/uri-list`, leaving out what isn't a local file.
+fn paths(list: &str) -> Vec<PathBuf> {
+    list.lines().filter(|l| !l.starts_with('#')).filter_map(crate::uri::to_path).collect()
+}
+
+/// Asks for `offer`'s list and reads it on a thread, telling the window
+/// the files, then `done`.
+fn read_list(offer: &WlDataOffer, conn: &Connection, over: Sender<Over>, ctx: egui::Context) -> Option<Receiver<()>> {
+    let (mut reader, writer) = std::io::pipe().ok()?;
+    offer.receive(URI_LIST.into(), writer.as_fd());
+    drop(writer);
+    let _ = conn.flush();
+    let (done, read) = channel();
+    std::thread::Builder::new()
+        .name("drag-read".into())
+        .spawn(move || {
+            use std::io::Read;
+            let mut list = String::new();
+            let _ = reader.read_to_string(&mut list);
+            let _ = over.send(Over::Incoming(paths(&list)));
+            ctx.request_repaint();
+            let _ = done.send(());
+        })
+        .ok()?;
+    Some(read)
+}
+
 /// The thread's side: the pointer's presses, the drag's data source, and
-/// our drag over our own window.
+/// drags over our window.
 struct State {
     shared: Arc<Mutex<Shared>>,
     pointer: Option<WlPointer>,
     window: WlSurface,
-    /// Our drag's offer, while it's over our window.
-    offer: Option<WlDataOffer>,
+    /// The drag over our window, if one is.
+    hover: Option<Hover>,
     /// Where it is there.
     at: egui::Pos2,
     over: Sender<Over>,
@@ -274,38 +335,51 @@ impl Dispatch<WlDataDevice, ()> for State {
         _: &WlDataDevice,
         event: wl_data_device::Event,
         _: &(),
-        _: &Connection,
+        conn: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // Only our own drag is taken here, over our own window; other apps'
-        // drags and the clipboard are let go at once.
+        // Drags of files are taken over our window, ours or another app's;
+        // anything else, and the clipboard, is let go at once.
         match event {
             wl_data_device::Event::Enter { serial, surface, x, y, id: Some(offer) } => {
-                if surface == state.window && state.shared().dragging {
-                    offer.accept(serial, Some(URI_LIST.into()));
-                    offer.set_actions(DndAction::Copy, DndAction::Copy);
-                    state.offer = Some(offer);
-                    state.at = egui::pos2(x as f32, y as f32);
-                    state.tell(Over::Moved(state.at));
-                } else {
+                let own = state.shared().dragging;
+                let files = offer
+                    .data::<OfferInfo>()
+                    .is_some_and(|i| i.types.lock().is_ok_and(|t| t.iter().any(|t| t == URI_LIST)));
+                if surface != state.window || !(own || files) {
                     offer.destroy();
+                    return;
                 }
+                offer.accept(serial, Some(URI_LIST.into()));
+                offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Move);
+                let read = if own { None } else { read_list(&offer, conn, state.over.clone(), state.ctx.clone()) };
+                state.hover = Some(Hover { offer, own, read });
+                state.at = egui::pos2(x as f32, y as f32);
+                state.tell(Over::Moved(state.at));
             }
-            wl_data_device::Event::Motion { x, y, .. } if state.offer.is_some() => {
+            wl_data_device::Event::Motion { x, y, .. } if state.hover.is_some() => {
                 state.at = egui::pos2(x as f32, y as f32);
                 state.tell(Over::Moved(state.at));
             }
             wl_data_device::Event::Leave => {
-                if let Some(offer) = state.offer.take() {
-                    offer.destroy();
+                if let Some(hover) = state.hover.take() {
+                    hover.offer.destroy();
                     state.tell(Over::Left);
                 }
             }
             wl_data_device::Event::Drop => {
-                if let Some(offer) = state.offer.take() {
-                    offer.finish();
-                    offer.destroy();
-                    state.tell(Over::Dropped(state.at));
+                if let Some(hover) = state.hover.take() {
+                    // The files must be known before egui is let go.
+                    if let Some(read) = &hover.read {
+                        let _ = read.recv_timeout(READ_WAIT);
+                    }
+                    let action = hover.offer.data::<OfferInfo>().and_then(|i| *i.action.lock().ok()?);
+                    if action.is_some() {
+                        hover.offer.finish();
+                    }
+                    hover.offer.destroy();
+                    let copy = action == Some(DndAction::Copy) && !hover.own;
+                    state.tell(Over::Dropped { at: state.at, copy });
                 }
             }
             wl_data_device::Event::Selection { id: Some(offer) } => offer.destroy(),
@@ -314,19 +388,33 @@ impl Dispatch<WlDataDevice, ()> for State {
     }
 
     event_created_child!(State, WlDataDevice, [
-        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, OfferInfo::default()),
     ]);
 }
 
-impl Dispatch<WlDataOffer, ()> for State {
+impl Dispatch<WlDataOffer, OfferInfo> for State {
     fn event(
         _: &mut Self,
         _: &WlDataOffer,
-        _: <WlDataOffer as Proxy>::Event,
-        _: &(),
+        event: <WlDataOffer as Proxy>::Event,
+        info: &OfferInfo,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        use wayland_client::protocol::wl_data_offer::Event;
+        match event {
+            Event::Offer { mime_type } => {
+                if let Ok(mut types) = info.types.lock() {
+                    types.push(mime_type);
+                }
+            }
+            Event::Action { dnd_action: WEnum::Value(action) } => {
+                if let Ok(mut chosen) = info.action.lock() {
+                    *chosen = Some(action);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -379,3 +467,14 @@ macro_rules! no_events {
     )*};
 }
 no_events!(WlDataDeviceManager, WlCompositor, WlShm, WlShmPool, WlSurface);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_list_gives_its_local_files() {
+        let list = "# from Nautilus\r\nfile:///home/a/b%20c.png\r\nhttps://example.com/x.png\r\nfile:///tmp/y\r\n";
+        assert_eq!(paths(list), [PathBuf::from("/home/a/b c.png"), PathBuf::from("/tmp/y")]);
+    }
+}

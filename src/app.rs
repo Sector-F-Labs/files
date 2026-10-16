@@ -20,7 +20,7 @@ use patina::tabs::{self, TabAction, TabStrip};
 
 use crate::chooser::{Answer, Filter, Request};
 use crate::config::{Config, View};
-use crate::drag_out::Over;
+use crate::dnd::Over;
 use crate::glyphs::{self, Glyph};
 use crate::icons::{self, Icons, Source};
 use crate::listing::{self, Entry, Kind, Listed, Location, SortBy};
@@ -255,11 +255,15 @@ enum Action {
 
 pub struct Files {
     /// Drags out of the window, to other apps, on Wayland (ADR-0006).
-    drag_out: Option<crate::drag_out::DragOut>,
+    dnd: Option<crate::dnd::Dnd>,
     /// The files egui is dragging are a Wayland drag too.
     dragging_out: bool,
     /// And it was dropped on our own window.
     dropped_here: bool,
+    /// Another app's (or Files window's) files are being dragged over us.
+    incoming: bool,
+    /// The drop just made is a copy, as the dragging app was told (Ctrl).
+    drop_copy: bool,
     config: Config,
     skins: Vec<Skin>,
     skin: usize,
@@ -367,17 +371,19 @@ impl Files {
             .collect();
         special.remove(Path::new("/"));
 
-        let drag_out = {
+        let dnd = {
             use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
             match (cc.display_handle(), cc.window_handle()) {
-                (Ok(d), Ok(w)) => crate::drag_out::DragOut::new(ctx, d.as_raw(), w.as_raw()),
+                (Ok(d), Ok(w)) => crate::dnd::Dnd::new(ctx, d.as_raw(), w.as_raw()),
                 _ => None,
             }
         };
         let mut files = Files {
-            drag_out,
+            dnd,
             dragging_out: false,
             dropped_here: false,
+            incoming: false,
+            drop_copy: false,
             config,
             skins,
             skin,
@@ -767,7 +773,7 @@ impl Files {
                 }
             }
             Action::Drop { paths, into } => {
-                let copy = ctx.input(|i| i.modifiers.ctrl);
+                let copy = ctx.input(|i| i.modifiers.ctrl) || std::mem::take(&mut self.drop_copy);
                 self.drop_into(paths, into, copy);
             }
             Action::Move(step) => self.step(step, ctx.input(|i| i.modifiers.shift)),
@@ -2378,7 +2384,7 @@ impl Files {
     /// Files being dragged become a Wayland drag, so whatever app is under
     /// the pointer when they're let go can take them (ADR-0006).
     fn drag_out(&mut self, ctx: &egui::Context) {
-        let Some(out) = &self.drag_out else { return };
+        let Some(out) = &self.dnd else { return };
         if self.dragging_out {
             return;
         }
@@ -2398,11 +2404,13 @@ impl Files {
         });
     }
 
-    /// Our Wayland drag over our own window, as the pointer egui no longer
-    /// gets while the compositor has it: moves, and a release where it was
-    /// dropped, or well away when it went elsewhere.
-    fn drag_over(&mut self, raw_input: &mut egui::RawInput) {
-        let Some(out) = &self.drag_out else { return };
+    /// A Wayland drag over our window, ours or another app's, as the
+    /// pointer egui doesn't get while the compositor has it: moves, and a
+    /// release where it was dropped, or well away when ours went elsewhere.
+    /// Another app's files are egui's payload while they're over us, so
+    /// folders light up and take them as they do our own (ADR-0007).
+    fn drag_over(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let Some(out) = &self.dnd else { return };
         let release = |pos: egui::Pos2, modifiers| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -2411,12 +2419,25 @@ impl Files {
         };
         for over in out.over() {
             match over {
+                Over::Incoming(paths) => {
+                    if !paths.is_empty() && !self.dragging_out {
+                        DragAndDrop::set_payload(ctx, Dragged(paths));
+                        self.incoming = true;
+                    }
+                }
                 Over::Moved(pos) => raw_input.events.push(egui::Event::PointerMoved(pos)),
-                Over::Left => raw_input.events.push(egui::Event::PointerGone),
-                Over::Dropped(pos) => {
-                    raw_input.events.push(egui::Event::PointerMoved(pos));
-                    raw_input.events.push(release(pos, raw_input.modifiers));
-                    self.dropped_here = true;
+                Over::Left => {
+                    raw_input.events.push(egui::Event::PointerGone);
+                    if std::mem::take(&mut self.incoming) {
+                        DragAndDrop::clear_payload(ctx);
+                    }
+                }
+                Over::Dropped { at, copy } => {
+                    raw_input.events.push(egui::Event::PointerMoved(at));
+                    raw_input.events.push(release(at, raw_input.modifiers));
+                    self.dropped_here = self.dragging_out;
+                    self.drop_copy = copy;
+                    self.incoming = false;
                 }
                 Over::Ended => {
                     if !self.dropped_here {
@@ -2435,7 +2456,7 @@ impl Files {
     /// What's being dragged, drawn beside the pointer.
     fn drag_ghost(&self, ctx: &egui::Context) {
         // The compositor draws a Wayland drag's icon.
-        if self.dragging_out {
+        if self.dragging_out || self.incoming {
             return;
         }
         let Some(dragged) = DragAndDrop::payload::<Dragged>(ctx) else { return };
@@ -2681,6 +2702,8 @@ impl eframe::App for Files {
         for action in std::mem::take(&mut self.actions) {
             self.apply(action, &ctx);
         }
+        // Only for a drop made this frame.
+        self.drop_copy = false;
         self.update_title(&ctx);
         if custom {
             frame::edges(&ctx, radius, style.border);
@@ -2694,7 +2717,7 @@ impl eframe::App for Files {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         frame::release_grab(ctx, raw_input);
-        self.drag_over(raw_input);
+        self.drag_over(ctx, raw_input);
         patina::ime::drop_repeated_preedits(ctx, raw_input);
     }
 

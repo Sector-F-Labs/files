@@ -48,3 +48,4 @@ mechanics of adding one.
 | [0004](0004-the-portal-file-chooser.md) | Files is the Patina session's file chooser, through the desktop portal | Accepted |
 | [0005](0005-network-shares-through-gvfs.md) | Network shares through GVfs, as Nautilus has them, opened as folders under its FUSE bridge | Accepted |
 | [0006](0006-drags-leave-the-window.md) | Dragging files is a Wayland drag, started on a connection of Files' own | Accepted |
+| [0007](0007-drops-from-other-apps.md) | Files takes other apps' drags of files, so files can be dragged between Files windows | Accepted |

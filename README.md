@@ -11,7 +11,8 @@ Files is installed.
 - Thumbnails for pictures; icons from the desktop's icon theme by file type.
 - Copy, cut and paste (on the clipboard in Nautilus's form, so the two paste each other's), drag
   to move (Ctrl to copy; another disk copies), rename in place (F2), new folder (Ctrl+Shift+N).
-- Drag files out into other apps (Telegram, a browser, Nautilus) on Wayland.
+- Drag files between Files windows, out into other apps (Telegram, a browser, Nautilus) and in
+  from them, on Wayland.
 - The Trash (freedesktop spec): Delete moves there; put back, delete permanently, empty.
 - Click, Ctrl/Shift-click, a band on the background, arrows and typing a name to select.
 - Path bar to click or drop on, Ctrl+L to type a location, Filter for the folder.

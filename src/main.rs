@@ -6,7 +6,7 @@
 mod app;
 mod chooser;
 mod config;
-mod drag_out;
+mod dnd;
 mod glyphs;
 mod icons;
 mod listing;
