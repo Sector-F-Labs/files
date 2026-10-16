@@ -12,6 +12,17 @@ use the `adr` skill to add one.
   yourself, a headless sway needs a virtual pointer that stays connected (wlrctl's goes away
   after each command, so clicks never arrive).
 
+## Testing the portal
+
+The chooser can be driven without touching the desktop's own portal: a private bus with
+`dbus-run-session`, `XDG_DESKTOP_PORTAL_DIR` pointing at a folder holding `patina.portal` *and*
+`patina-portals.conf` (with that variable set, the portal reads its config only from there),
+`XDG_CURRENT_DESKTOP=Patina`, the D-Bus service file in `$XDG_DATA_DIRS/dbus-1/services`, and a
+client that stays connected until `Response` arrives (the portal drops a request whose caller
+has gone, so `gdbus call` alone doesn't work; Python's Gio does). Show it on a headless sway and
+type with one `wtype -s 1000 ...` run (separate runs add and remove the keyboard, and keys get
+lost). `pgrep -f` matches your own shell: find processes with `pgrep -x files`.
+
 ## Layout
 
 - `src/app.rs`: the window: menus and tabs, toolbar and path bar, sidebar, icon and list views,
@@ -22,6 +33,10 @@ use the `adr` skill to add one.
   Stop; free names ("name copy"), new folder, rename.
 - `src/icons.rs`: theme icons, app icons and thumbnails on a thread, newest request first.
 - `src/mime.rs`: types from shared-mime-info's `globs2`, icon names, descriptions.
+- `src/portal.rs`: `files --portal`, the `org.freedesktop.impl.portal.FileChooser` service;
+  each request runs `files --choose` (a process per dialog: one winit loop per process).
+  `src/chooser.rs`: the request and answer (TOML over stdin/stdout), filters and globs.
+  Picking mode in `app.rs` is `Files::picking`: no menus or tabs, the chooser bar, `accept`.
 - `src/places.rs`, `src/watch.rs` (notify), `src/uri.rs` (file URIs, the clipboard's form),
   `src/config.rs` (`~/.config/files/config.toml`), `src/glyphs.rs` (painted toolbar symbols).
 

@@ -4,6 +4,7 @@
 //! (patina-apps).
 
 mod app;
+mod chooser;
 mod config;
 mod glyphs;
 mod icons;
@@ -11,16 +12,24 @@ mod listing;
 mod mime;
 mod ops;
 mod places;
+mod portal;
 mod uri;
 mod watch;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 const USAGE: &str = "usage: files [FOLDER | FILE | URI]
+       files --portal
+       files --choose < request.toml
 
 Opens a window on FOLDER (default: home), or on the folder holding FILE with
-it selected. file:// URIs are understood too.";
+it selected. file:// URIs are understood too.
+
+--portal serves Patina's file chooser to the desktop portal
+(org.freedesktop.impl.portal.FileChooser); --choose shows one chooser for the
+request on stdin and prints what was chosen, exiting 1 if cancelled.";
 
 /// The icon, drawn for the window from the same SVG the launcher shows.
 const ICON_SVG: &[u8] = include_bytes!("../packaging/linux/files.svg");
@@ -44,6 +53,8 @@ fn main() -> ExitCode {
     let mut start = None;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
+            "--portal" => return portal::run(),
+            "--choose" => return choose(),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -58,13 +69,37 @@ fn main() -> ExitCode {
             _ => {}
         }
     }
+    run(app::Start::Browse(start), [960.0, 620.0])
+}
+
+/// One chooser for the request on stdin; prints the answer, or exits 1.
+fn choose() -> ExitCode {
+    let request = match portal::read_request() {
+        Ok(request) => request,
+        Err(e) => {
+            eprintln!("files: the request doesn't read: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let answer = Arc::new(Mutex::new(None));
+    let code = run(app::Start::Choose(request, answer.clone()), [880.0, 560.0]);
+    match answer.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some(answer) => {
+            portal::print_answer(&answer);
+            code
+        }
+        None => ExitCode::from(1),
+    }
+}
+
+fn run(start: app::Start, size: [f32; 2]) -> ExitCode {
     let options = eframe::NativeOptions {
         viewport: patina::frame::viewport(
             egui::ViewportBuilder::default()
                 .with_title("Files")
                 .with_app_id("com.sectorflabs.Files")
                 .with_icon(window_icon())
-                .with_inner_size([960.0, 620.0])
+                .with_inner_size(size)
                 .with_min_inner_size([520.0, 340.0]),
             true,
         ),

@@ -17,11 +17,16 @@ Files is installed.
 - Watches the folders on screen and re-reads them when they change.
 - Patina skins (Skin menu; `~/.config/files/skins`) and the Patina frame or the desktop's.
 
+- The file chooser for other apps: in the Patina session, any app that asks the desktop portal
+  for a file (rfd's default, Firefox, Chrome, GTK and Qt apps set to use portals) gets Files'
+  chooser: open, several files, a folder, or save, with the app's file types.
+
 ## Install
 
 ```sh
 make install      # ~/.local/bin/files, its .desktop file and icon
 make default      # optional: open folders in Files instead of Nautilus
+make install-portal   # be the file chooser in the Patina session (root; SUDO=doas)
 make app          # or target/Files.app, to copy into ~/Apps
 ```
 

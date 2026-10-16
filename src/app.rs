@@ -5,8 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::text::{CCursor, CCursorRange, LayoutJob};
@@ -18,6 +18,7 @@ use patina::frame::{self, FrameStyle, TitleBar};
 use patina::skin::{self, Skin};
 use patina::tabs::{self, TabAction, TabStrip};
 
+use crate::chooser::{Answer, Filter, Request};
 use crate::config::{Config, View};
 use crate::glyphs::{self, Glyph};
 use crate::icons::{self, Icons, Source};
@@ -65,6 +66,8 @@ struct Tab {
     rename_after: Option<PathBuf>,
     scroll_to: Option<PathBuf>,
     filter: String,
+    /// While choosing: the file types shown; other files are left out.
+    types: Option<Filter>,
 }
 
 impl Tab {
@@ -83,6 +86,7 @@ impl Tab {
             rename_after: None,
             scroll_to: None,
             filter: String::new(),
+            types: None,
         }
     }
 
@@ -104,7 +108,9 @@ impl Tab {
         (0..self.entries.len())
             .filter(|&i| {
                 let e = &self.entries[i];
-                (show_hidden || !e.hidden) && (filter.is_empty() || e.name.to_lowercase().contains(&filter))
+                let typed =
+                    e.kind != Kind::File || self.types.as_ref().is_none_or(|t| t.matches(&e.name, e.mime.as_deref()));
+                typed && (show_hidden || !e.hidden) && (filter.is_empty() || e.name.to_lowercase().contains(&filter))
             })
             .collect()
     }
@@ -140,6 +146,38 @@ struct Clip {
 enum Confirm {
     Purge(Vec<trash::TrashItem>),
     EmptyTrash,
+    /// Saving over a file that's there.
+    Replace(PathBuf),
+}
+
+/// How the window starts: browsing, or choosing for an app (ADR-0004).
+pub enum Start {
+    Browse(Option<PathBuf>),
+    Choose(Request, Arc<Mutex<Option<Answer>>>),
+}
+
+/// Choosing files for an app, through the portal.
+struct Picking {
+    request: Request,
+    /// The save field's name.
+    name: String,
+    /// The file type chosen, an index into the request's filters.
+    filter: Option<usize>,
+    /// Where the answer goes when the window closes.
+    answer: Arc<Mutex<Option<Answer>>>,
+    /// Whether the save field has been focused, with its name selected.
+    name_started: bool,
+}
+
+impl Picking {
+    /// The types shown: the chosen filter's, or only folders when choosing
+    /// a folder.
+    fn types(&self) -> Option<Filter> {
+        if self.request.directory {
+            return Some(Filter::default());
+        }
+        self.filter.and_then(|i| self.request.filters.get(i)).cloned()
+    }
 }
 
 enum Action {
@@ -150,7 +188,11 @@ enum Action {
     Back,
     Forward,
     Up,
-    Click { path: PathBuf, add: bool, range: bool },
+    Click {
+        path: PathBuf,
+        add: bool,
+        range: bool,
+    },
     SelectOnly(Vec<PathBuf>),
     SelectAll,
     ClearSelection,
@@ -166,11 +208,18 @@ enum Action {
     NewFolder,
     Terminal(PathBuf),
     NewWindow,
-    Drop { paths: Vec<PathBuf>, into: Location },
+    Drop {
+        paths: Vec<PathBuf>,
+        into: Location,
+    },
     Move(isize),
     Tab(TabAction),
     CloseTab,
     Quit,
+    Accept,
+    Cancel,
+    /// While choosing: a typed path, chosen as it is.
+    ChoosePath(PathBuf),
     SetView(View),
     ToggleHidden,
     EditLocation,
@@ -200,6 +249,8 @@ pub struct Files {
     clip: Option<Clip>,
     renaming: Option<Renaming>,
     location_edit: Option<String>,
+    /// Whether the location field has been focused, with its text selected.
+    location_started: bool,
     focus_filter: bool,
     confirm: Option<Confirm>,
     /// Something to tell the user, until they do something else.
@@ -217,10 +268,11 @@ pub struct Files {
     actions: Vec<Action>,
     title: String,
     screenshot: Option<(PathBuf, bool)>,
+    picking: Option<Picking>,
 }
 
 impl Files {
-    pub fn new(cc: &eframe::CreationContext<'_>, start: Option<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, start: Start) -> Self {
         patina::appearance::watch(&cc.egui_ctx);
         let ctx = &cc.egui_ctx;
         let config = Config::load();
@@ -228,6 +280,21 @@ impl Files {
         let skin = skins.iter().position(|s| s.name == config.skin).unwrap_or(0);
         let (listed_send, listed) = channel();
 
+        let (start, picking) = match start {
+            Start::Browse(path) => (path, None),
+            Start::Choose(request, answer) => {
+                // Where the app says, else where the last choice was made.
+                let folder = request.start().or_else(|| config.chooser_folder.clone().filter(|f| f.is_dir()));
+                let picking = Picking {
+                    name: request.start_name(),
+                    filter: request.current_filter.or((!request.filters.is_empty()).then_some(0)),
+                    request,
+                    answer,
+                    name_started: false,
+                };
+                (folder, Some(picking))
+            }
+        };
         // A file to start at opens its folder with it selected.
         let (location, select) = match start {
             Some(path) if path.is_dir() => (Location::Folder(path), None),
@@ -239,6 +306,7 @@ impl Files {
         };
         let mut first = Tab::new(location);
         first.select_after.extend(select);
+        first.types = picking.as_ref().and_then(Picking::types);
 
         let places = places::places();
         let mut special: HashMap<PathBuf, Source> = places
@@ -271,6 +339,7 @@ impl Files {
             clip: None,
             renaming: None,
             location_edit: None,
+            location_started: false,
             focus_filter: false,
             confirm: None,
             notice: None,
@@ -282,6 +351,7 @@ impl Files {
             actions: Vec::new(),
             title: String::new(),
             screenshot: std::env::var_os("FILES_SCREENSHOT").map(|p| (PathBuf::from(p), false)),
+            picking,
         };
         files.apply_skin(ctx);
         if files.config.system_title_bar {
@@ -549,6 +619,9 @@ impl Files {
                 }
             }
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::Accept => self.accept(ctx),
+            Action::Cancel => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::ChoosePath(path) => self.choose_path(path, ctx),
             Action::SetView(view) => {
                 self.config.view = view;
                 self.config.save();
@@ -558,6 +631,7 @@ impl Files {
                 self.config.save();
             }
             Action::EditLocation => {
+                self.location_started = false;
                 self.location_edit = Some(match &self.current().location {
                     Location::Folder(path) => path.display().to_string(),
                     Location::Trash => String::new(),
@@ -607,6 +681,19 @@ impl Files {
             self.notice = Some(format!("Put “{}” back to open it.", entry.name));
             return;
         }
+        if self.picking.is_some() {
+            match entry.kind {
+                Kind::Folder | Kind::App => self.go(Location::Folder(entry.path), ctx),
+                Kind::File => {
+                    self.current_mut().select_only([entry.path.clone()]);
+                    if let Some(picking) = &mut self.picking {
+                        picking.name = entry.file_name();
+                    }
+                    self.accept(ctx);
+                }
+            }
+            return;
+        }
         match entry.kind {
             Kind::Folder => self.go(Location::Folder(entry.path), ctx),
             Kind::App => match patina_apps::read(&entry.path).and_then(|app| app.launch().map_err(|e| e.to_string())) {
@@ -621,7 +708,78 @@ impl Files {
         }
     }
 
+    /// The accept button: answers with what's chosen, or goes into the one
+    /// folder selected; saving over a file asks first.
+    fn accept(&mut self, ctx: &egui::Context) {
+        let Some(picking) = &self.picking else { return };
+        let tab = self.current();
+        let Some(folder) = tab.folder().map(Path::to_path_buf) else { return };
+        let selection: Vec<Entry> = tab.selection().into_iter().cloned().collect();
+        let folders: Vec<&Entry> = selection.iter().filter(|e| e.kind != Kind::File).collect();
+        let paths = if picking.request.save {
+            let name = picking.name.trim();
+            if name.is_empty() {
+                return;
+            }
+            let path = folder.join(name);
+            if path.is_dir() {
+                self.go(Location::Folder(path), ctx);
+                return;
+            }
+            if path.exists() && !matches!(self.confirm, Some(Confirm::Replace(_))) {
+                self.confirm = Some(Confirm::Replace(path));
+                return;
+            }
+            vec![path]
+        } else if picking.request.directory {
+            if folders.is_empty() { vec![folder.clone()] } else { folders.iter().map(|e| e.path.clone()).collect() }
+        } else {
+            if let [only] = &selection[..]
+                && only.kind != Kind::File
+            {
+                let path = only.path.clone();
+                self.go(Location::Folder(path), ctx);
+                return;
+            }
+            let files: Vec<PathBuf> =
+                selection.iter().filter(|e| e.kind == Kind::File).map(|e| e.path.clone()).collect();
+            if files.is_empty() {
+                return;
+            }
+            if picking.request.multiple { files } else { files.into_iter().take(1).collect() }
+        };
+        let answer = Answer { paths, filter: picking.filter };
+        *picking.answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(answer);
+        self.config.chooser_folder = Some(folder);
+        self.config.save();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// A typed path: saved to as it is, or opened if it's a file.
+    fn choose_path(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let Some(picking) = &mut self.picking else { return };
+        let Some(parent) = path.parent().map(Path::to_path_buf) else { return };
+        if picking.request.save {
+            picking.name = places::name(&path);
+            self.go(Location::Folder(parent), ctx);
+            // Listing the folder isn't needed to save into it.
+            self.accept(ctx);
+        } else if path.is_file() {
+            let answer = Answer { paths: vec![path], filter: picking.filter };
+            *picking.answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(answer);
+            self.config.chooser_folder = Some(parent);
+            self.config.save();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn click(&mut self, path: PathBuf, add: bool, range: bool) {
+        if let Some(picking) = &mut self.picking
+            && picking.request.save
+            && let Some(entry) = self.tabs[self.tab].entries.iter().find(|e| e.path == path && e.kind == Kind::File)
+        {
+            picking.name = entry.file_name();
+        }
         let show_hidden = self.config.show_hidden;
         let tab = self.current_mut();
         if range && let Some(anchor) = tab.anchor.clone() {
@@ -799,6 +957,7 @@ impl Files {
         let columns = if self.config.view == View::Icons { self.columns as isize } else { 1 };
         let page = if self.config.view == View::Icons { columns * 4 } else { 12 };
         let in_trash = self.current().in_trash();
+        let picking = self.picking.is_some();
         ctx.input_mut(|i| {
             i.events.retain(|event| {
                 let action = match event {
@@ -812,6 +971,9 @@ impl Files {
                     Event::Key { key, pressed: true, modifiers: m, .. } => {
                         let plain = !m.command && !m.alt;
                         match key {
+                            Key::Enter if plain && picking => Action::Accept,
+                            Key::Escape if picking => Action::Cancel,
+                            Key::N | Key::T | Key::W | Key::Q if picking && m.command && !m.shift => return true,
                             Key::Enter if plain => match self.tabs[self.tab].selection().first() {
                                 Some(e) if !m.shift => Action::Open(e.path.clone()),
                                 _ => return true,
@@ -892,6 +1054,11 @@ impl Files {
     // ---- Drawing ----
 
     fn header(&mut self, ui: &mut Ui, style: &FrameStyle, span: egui::Rangef) {
+        if let Some(picking) = &self.picking {
+            let title = picking.request.title();
+            TitleBar::new(&title, style).custom(!self.config.system_title_bar).show(ui, |_| {}, |_| {});
+            return;
+        }
         let titles: Vec<String> = self.tabs.iter().map(|t| Self::title_of(&t.location)).collect();
         let mut action = None;
         TitleBar::new("", style).custom(!self.config.system_title_bar).menu_bar(true).show(
@@ -1193,8 +1360,15 @@ impl Files {
     /// or a double click on the bar turns it into a field.
     fn path_bar(&mut self, ui: &mut Ui, a: &mut Vec<Action>) {
         if let Some(text) = &mut self.location_edit {
+            let all = text.chars().count();
             let resp = ui.add(egui::TextEdit::singleline(text).desired_width(ui.available_width()));
-            if !resp.has_focus() && !resp.lost_focus() {
+            if !self.location_started {
+                // All of it selected, so typing replaces it.
+                self.location_started = true;
+                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
+                    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(all))));
+                    state.store(ui.ctx(), resp.id);
+                }
                 resp.request_focus();
             }
             if resp.lost_focus() {
@@ -1203,6 +1377,8 @@ impl Files {
                     let path = expand(&text);
                     if path.is_dir() {
                         a.push(Action::Go(Location::Folder(path)));
+                    } else if self.picking.is_some() && (path.is_file() || path.parent().is_some_and(Path::is_dir)) {
+                        a.push(Action::ChoosePath(path));
                     } else if let Some(parent) = path.parent().filter(|_| path.exists()) {
                         a.push(Action::Go(Location::Folder(parent.to_path_buf())));
                         self.tabs[self.tab].select_after = vec![path];
@@ -1270,6 +1446,62 @@ impl Files {
                 ui.add_space(10.0);
             }
         });
+        self.actions.extend(a);
+    }
+
+    /// While choosing: the name to save as, the file types, Cancel and the
+    /// accept button.
+    fn chooser_bar(&mut self, ui: &mut Ui) {
+        let Some(picking) = &mut self.picking else { return };
+        let mut a = Vec::new();
+        let mut types_changed = false;
+        ui.horizontal(|ui| {
+            if picking.request.save {
+                ui.label("Name:");
+                let field = ui.add(egui::TextEdit::singleline(&mut picking.name).desired_width(260.0));
+                if !picking.name_started {
+                    picking.name_started = true;
+                    // The name without its extension, ready to type over.
+                    let stem = ops::split_extension(&picking.name).0.chars().count();
+                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), field.id) {
+                        state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(stem))));
+                        state.store(ui.ctx(), field.id);
+                    }
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    a.push(Action::Accept);
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                let label = picking.request.accept_label();
+                if ui.add(egui::Button::new(egui::RichText::new(label).strong()).min_size(vec2(80.0, 0.0))).clicked() {
+                    a.push(Action::Accept);
+                }
+                if ui.add(egui::Button::new("Cancel").min_size(vec2(80.0, 0.0))).clicked() {
+                    a.push(Action::Cancel);
+                }
+                if let Some(notice) = &self.notice {
+                    let text = egui::RichText::new(notice).color(ui.visuals().error_fg_color);
+                    ui.add(egui::Label::new(text).truncate());
+                }
+                if !picking.request.filters.is_empty() && !picking.request.directory {
+                    let filters = &picking.request.filters;
+                    let shown = picking.filter.and_then(|i| filters.get(i)).map_or("All files", |f| f.name.as_str());
+                    egui::ComboBox::from_id_salt("types").selected_text(shown).show_ui(ui, |ui| {
+                        for (i, filter) in filters.iter().enumerate() {
+                            types_changed |= ui.selectable_value(&mut picking.filter, Some(i), &filter.name).clicked();
+                        }
+                    });
+                }
+            });
+        });
+        if types_changed {
+            let types = picking.types();
+            for tab in &mut self.tabs {
+                tab.types = types.clone();
+            }
+        }
         self.actions.extend(a);
     }
 
@@ -1854,7 +2086,11 @@ impl Files {
             }
             Confirm::Purge(items) => (format!("Delete {} items permanently?", items.len()), "They can't be put back."),
             Confirm::EmptyTrash => ("Empty the Trash?".to_string(), "Everything in it is deleted for good."),
+            Confirm::Replace(path) => {
+                (format!("Replace “{}”?", places::name(path)), "A file with that name is already there.")
+            }
         };
+        let yes = if matches!(confirm, Confirm::Replace(_)) { "Replace" } else { "Delete" };
         let mut answer = None;
         let modal = egui::Modal::new(Id::new("confirm")).show(ctx, |ui| {
             ui.set_width(320.0);
@@ -1862,7 +2098,7 @@ impl Files {
             ui.label(detail);
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Delete").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                if ui.button(yes).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                     answer = Some(true);
                 }
                 if ui.button("Cancel").clicked() {
@@ -1874,6 +2110,11 @@ impl Files {
             answer = answer.or(Some(false));
         }
         match answer {
+            Some(true) if matches!(self.confirm, Some(Confirm::Replace(_))) => {
+                // Accepting again finds the confirmation and answers.
+                self.accept(ctx);
+                self.confirm = None;
+            }
             Some(true) => {
                 let op = match self.confirm.take() {
                     Some(Confirm::Purge(items)) => Op::Purge(items),
@@ -1887,7 +2128,10 @@ impl Files {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let title = Self::title_of(&self.current().location);
+        let title = match &self.picking {
+            Some(picking) => picking.request.title(),
+            None => Self::title_of(&self.current().location),
+        };
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
@@ -1930,7 +2174,9 @@ impl eframe::App for Files {
         let style = self.skins[self.skin].frame_style(ui.visuals());
         let radius = if custom { frame::corner_radius(&ctx, style.radius) } else { 0 };
 
-        if let Some(action) = tabs::keys(&ctx, self.tabs.len(), self.tab) {
+        if self.picking.is_none()
+            && let Some(action) = tabs::keys(&ctx, self.tabs.len(), self.tab)
+        {
             self.actions.push(Action::Tab(action));
         }
         self.keys(&ctx);
@@ -1949,7 +2195,7 @@ impl eframe::App for Files {
                     .inner_margin(egui::Margin::symmetric(10, 4))
                     .corner_radius(CornerRadius { sw: radius, se: radius, ..Default::default() }),
             )
-            .show(ui, |ui| self.status_bar(ui));
+            .show(ui, |ui| if self.picking.is_some() { self.chooser_bar(ui) } else { self.status_bar(ui) });
         egui::Panel::left("sidebar")
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(8, 0)))
             .default_size(180.0)

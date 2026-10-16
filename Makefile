@@ -5,8 +5,14 @@ PREFIX ?= $(HOME)/.local
 BINDIR := $(PREFIX)/bin
 APPSDIR := $(PREFIX)/share/applications
 ICONDIR := $(PREFIX)/share/icons/hicolor
+DBUSDIR := $(PREFIX)/share/dbus-1/services
+PORTAL_SERVICE := org.freedesktop.impl.portal.desktop.patina
+# xdg-desktop-portal reads its .portal files and configuration only from
+# system folders, so install-portal needs root (SUDO=doas where that's it).
+PORTALDIR := /usr/share/xdg-desktop-portal
+SUDO ?= sudo
 
-.PHONY: help run build test check install uninstall default app clean
+.PHONY: help run build test check install uninstall default install-portal uninstall-portal app clean
 
 help: ## Show this help
 	@echo "Usage: make <target>"
@@ -32,6 +38,8 @@ install: build ## Install Files and its launcher for the current user (PREFIX=~/
 	install -Dm644 packaging/linux/files.svg $(ICONDIR)/scalable/apps/$(APP_ID).svg
 	install -d $(APPSDIR)
 	sed 's|^Exec=files|Exec=$(BINDIR)/files|' packaging/linux/$(APP_ID).desktop > $(APPSDIR)/$(APP_ID).desktop
+	install -d $(DBUSDIR)
+	sed 's|@BINDIR@|$(BINDIR)|' packaging/portal/$(PORTAL_SERVICE).service > $(DBUSDIR)/$(PORTAL_SERVICE).service
 	-update-desktop-database -q $(APPSDIR)
 	-@test ! -f $(ICONDIR)/icon-theme.cache || gtk-update-icon-cache -q -t -f $(ICONDIR)
 	@echo "Installed $(BINDIR)/files and the $(APP_ID) launcher"
@@ -40,8 +48,17 @@ default: ## Make Files the app that opens folders (xdg-mime)
 	xdg-mime default $(APP_ID).desktop inode/directory
 	@echo "Folders now open in Files; 'xdg-mime default org.gnome.Nautilus.desktop inode/directory' undoes it"
 
+install-portal: install ## Also be the file chooser in the Patina session, for every app using the portal (asks for root)
+	@test "$$(id -u)" != 0 || { echo "Run make install-portal without sudo; it asks itself."; exit 1; }
+	$(SUDO) install -Dm644 packaging/portal/patina.portal $(PORTALDIR)/portals/patina.portal
+	$(SUDO) install -Dm644 packaging/portal/patina-portals.conf $(PORTALDIR)/patina-portals.conf
+	@echo "Installed. Apps in the next Patina session (XDG_CURRENT_DESKTOP=Patina) get Files' chooser."
+
+uninstall-portal: ## Remove the portal files (asks for root)
+	$(SUDO) rm -f $(PORTALDIR)/portals/patina.portal $(PORTALDIR)/patina-portals.conf
+
 uninstall: ## Remove what make install put in place
-	rm -f $(BINDIR)/files $(APPSDIR)/$(APP_ID).desktop $(ICONDIR)/scalable/apps/$(APP_ID).svg
+	rm -f $(BINDIR)/files $(APPSDIR)/$(APP_ID).desktop $(ICONDIR)/scalable/apps/$(APP_ID).svg $(DBUSDIR)/$(PORTAL_SERVICE).service
 	-update-desktop-database -q $(APPSDIR)
 	-@test ! -f $(ICONDIR)/icon-theme.cache || gtk-update-icon-cache -q -t -f $(ICONDIR)
 

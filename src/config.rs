@@ -24,6 +24,8 @@ pub struct Config {
     pub skin: String,
     /// "system", "light" or "dark", while the skin follows the desktop.
     pub light_dark: String,
+    /// Where the last file was chosen for an app, to start the next there.
+    pub chooser_folder: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -35,6 +37,7 @@ impl Default for Config {
             system_title_bar: false,
             skin: patina::skin::DEFAULT_SKIN.into(),
             light_dark: "system".into(),
+            chooser_folder: None,
         }
     }
 }
