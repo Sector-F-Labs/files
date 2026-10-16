@@ -12,6 +12,8 @@ pub enum Glyph {
     Separator,
     Icons,
     List,
+    /// Unmounting a share.
+    Eject,
 }
 
 pub fn paint(painter: &Painter, rect: Rect, glyph: Glyph, stroke: Stroke) {
@@ -39,6 +41,14 @@ pub fn paint(painter: &Painter, rect: Rect, glyph: Glyph, stroke: Stroke) {
                     egui::StrokeKind::Middle,
                 );
             }
+        }
+        Glyph::Eject => {
+            let stroke = Stroke::new(1.2, stroke.color);
+            let top = c.y - s * 1.0;
+            let base = c.y + s * 0.25;
+            painter.line(vec![pos2(c.x - s, base), pos2(c.x, top), pos2(c.x + s, base), pos2(c.x - s, base)], stroke);
+            let y = c.y + s * 0.85;
+            painter.line_segment([pos2(c.x - s, y), pos2(c.x + s, y)], stroke);
         }
         Glyph::List => {
             for dy in [-1.0, 0.0, 1.0] {

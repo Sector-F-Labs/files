@@ -15,6 +15,9 @@ use crate::mime::{self, Mime};
 pub enum Location {
     Folder(PathBuf),
     Trash,
+    /// Servers on the network, or a server's shares, by GVfs URI
+    /// (`network:///`, `smb://host/`), listed by `network`.
+    Network(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,15 @@ pub struct Entry {
     pub executable: bool,
     /// In the trash: where it was, and the item to restore or purge.
     pub trashed: Option<trash::TrashItem>,
+    /// A server or share on the network, whose path is its URI.
+    pub remote: Option<Remote>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Remote {
+    pub uri: String,
+    /// Its theme icon names, the first found wins.
+    pub icon: Vec<String>,
 }
 
 impl Entry {
@@ -54,7 +66,7 @@ impl Entry {
 
     /// Whether opening it goes into it.
     pub fn is_folder(&self) -> bool {
-        self.kind == Kind::Folder && self.trashed.is_none()
+        self.kind == Kind::Folder && self.trashed.is_none() && self.remote.is_none()
     }
 }
 
@@ -63,6 +75,7 @@ pub fn read(location: &Location, mime: &Mime) -> Result<Vec<Entry>, String> {
     match location {
         Location::Folder(dir) => read_dir(dir, mime).map_err(|e| e.to_string()),
         Location::Trash => read_trash(mime),
+        Location::Network(_) => Err("The network is listed by GVfs".into()),
     }
 }
 
@@ -98,6 +111,7 @@ fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime) ->
                 describe: "Application".into(),
                 executable: false,
                 trashed: None,
+                remote: None,
             };
         }
         let size = std::fs::read_dir(&path).map_or(0, |d| d.count() as u64);
@@ -113,6 +127,7 @@ fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime) ->
             describe: "Folder".into(),
             executable: false,
             trashed: None,
+            remote: None,
         };
     }
     let ty = mime.guess(&file_name).map(str::to_string);
@@ -134,6 +149,7 @@ fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime) ->
         describe,
         executable,
         trashed: None,
+        remote: None,
     }
 }
 
@@ -161,6 +177,7 @@ fn read_trash(mime: &Mime) -> Result<Vec<Entry>, String> {
                     describe: "File".into(),
                     executable: false,
                     trashed: None,
+                    remote: None,
                 },
             };
             if entry.kind == Kind::App {

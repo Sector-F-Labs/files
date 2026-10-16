@@ -10,6 +10,7 @@ mod glyphs;
 mod icons;
 mod listing;
 mod mime;
+mod network;
 mod ops;
 mod places;
 mod portal;
@@ -20,12 +21,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-const USAGE: &str = "usage: files [FOLDER | FILE | URI]
+const USAGE: &str = "usage: files [FOLDER | FILE | URI | smb://SERVER[/SHARE] | network:///]
        files --portal
        files --choose < request.toml
 
 Opens a window on FOLDER (default: home), or on the folder holding FILE with
-it selected. file:// URIs are understood too.
+it selected. file:// URIs are understood too; a network URI lists the
+network or a server's shares, or mounts a share and opens it.
 
 --portal serves Patina's file chooser to the desktop portal
 (org.freedesktop.impl.portal.FileChooser); --choose shows one chooser for the
@@ -62,6 +64,9 @@ fn main() -> ExitCode {
             "-V" | "--version" => {
                 println!("files {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
+            }
+            _ if start.is_none() && arg.contains("://") && uri::to_path(&arg).is_none() => {
+                return run(app::Start::Remote(arg), [960.0, 620.0]);
             }
             _ if start.is_none() => {
                 start = uri::to_path(&arg).or_else(|| std::path::absolute(PathBuf::from(&arg)).ok());

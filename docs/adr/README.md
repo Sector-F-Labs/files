@@ -46,3 +46,4 @@ mechanics of adding one.
 | [0002](0002-app-folders-are-one-item.md) | A .app folder is one item, opened by running it, read by patina-apps | Accepted |
 | [0003](0003-operations-never-overwrite.md) | One operations thread, and a name that's taken is never overwritten | Accepted |
 | [0004](0004-the-portal-file-chooser.md) | Files is the Patina session's file chooser, through the desktop portal | Accepted |
+| [0005](0005-network-shares-through-gvfs.md) | Network shares through GVfs, as Nautilus has them, opened as folders under its FUSE bridge | Accepted |

@@ -15,7 +15,11 @@ Files is installed.
 - Click, Ctrl/Shift-click, a band on the background, arrows and typing a name to select.
 - Path bar to click or drop on, Ctrl+L to type a location, Filter for the folder.
 - Watches the folders on screen and re-reads them when they change.
-- Patina skins (Skin menu; `~/.config/files/skins`) and the Patina frame or the desktop's.
+- The network, through GVfs as in Nautilus: servers found on the network, a server's shares,
+  mounting one (with a password, saved in the keyring if you like) and unmounting from the
+  sidebar; `smb://` URIs in the location bar or Go → Connect to Server….
+- Patina skins (Skin menu, as in every Patina app; `~/.config/files/skins`), a status bar, and
+  the Patina frame or the desktop's.
 
 - The file chooser for other apps: in the Patina session, any app that asks the desktop portal
   for a file (rfd's default, Firefox, Chrome, GTK and Qt apps set to use portals) gets Files'

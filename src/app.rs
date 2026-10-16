@@ -24,6 +24,7 @@ use crate::glyphs::{self, Glyph};
 use crate::icons::{self, Icons, Source};
 use crate::listing::{self, Entry, Kind, Listed, Location, SortBy};
 use crate::mime::Mime;
+use crate::network::{self, Network};
 use crate::ops::{self, Op};
 use crate::places::{self, Place};
 use crate::uri;
@@ -93,8 +94,13 @@ impl Tab {
     fn folder(&self) -> Option<&Path> {
         match &self.location {
             Location::Folder(path) => Some(path),
-            Location::Trash => None,
+            Location::Trash | Location::Network(_) => None,
         }
+    }
+
+    /// Whether it lists servers or shares, not files.
+    fn remote(&self) -> bool {
+        matches!(self.location, Location::Network(_))
     }
 
     fn in_trash(&self) -> bool {
@@ -143,6 +149,18 @@ struct Clip {
     text: String,
 }
 
+/// A server's question for the user, being answered.
+struct Asking {
+    ask: network::Ask,
+    user: String,
+    domain: String,
+    password: String,
+    anonymous: bool,
+    save: network::Save,
+    /// Whether a field has been given the keys.
+    focused: bool,
+}
+
 enum Confirm {
     Purge(Vec<trash::TrashItem>),
     EmptyTrash,
@@ -153,6 +171,8 @@ enum Confirm {
 /// How the window starts: browsing, or choosing for an app (ADR-0004).
 pub enum Start {
     Browse(Option<PathBuf>),
+    /// The network, a server, or a share to mount, by GVfs URI.
+    Remote(String),
     Choose(Request, Arc<Mutex<Option<Answer>>>),
 }
 
@@ -214,6 +234,12 @@ enum Action {
     },
     Move(isize),
     Tab(TabAction),
+    /// A typed URI that isn't a file's: a server to list or a share to mount.
+    OpenUri(String),
+    /// Mounts a share, then goes into it; with a name for the status bar.
+    Mount(String, String),
+    Unmount(String),
+    ConnectToServer,
     CloseTab,
     Quit,
     Accept,
@@ -251,10 +277,20 @@ pub struct Files {
     location_edit: Option<String>,
     /// Whether the location field has been focused, with its text selected.
     location_started: bool,
+    /// Whether the location field starts with its text selected, to type
+    /// over, or the cursor at its end, to go on typing.
+    location_select: bool,
+    network: Network,
+    /// The network shares mounted now.
+    mounts: Vec<network::Mount>,
+    /// Questions from servers, the first one showing.
+    asking: Vec<Asking>,
+    /// A share being mounted to go into: its URI and name.
+    connecting: Option<(String, String)>,
     focus_filter: bool,
     confirm: Option<Confirm>,
-    /// Something to tell the user, until they do something else.
-    notice: Option<String>,
+    /// The latest message for the status bar, until the next replaces it.
+    message: Option<Message>,
     typed: (String, Instant),
     /// The icon view's columns, for the arrow keys.
     columns: usize,
@@ -279,9 +315,15 @@ impl Files {
         let (skins, skin_errors) = load_skins();
         let skin = skins.iter().position(|s| s.name == config.skin).unwrap_or(0);
         let (listed_send, listed) = channel();
+        let network = Network::new(ctx, listed_send.clone());
 
+        let mut remote = None;
         let (start, picking) = match start {
             Start::Browse(path) => (path, None),
+            Start::Remote(uri) => {
+                remote = Some(uri);
+                (None, None)
+            }
             Start::Choose(request, answer) => {
                 // Where the app says, else where the last choice was made.
                 let folder = request.start().or_else(|| config.chooser_folder.clone().filter(|f| f.is_dir()));
@@ -313,7 +355,7 @@ impl Files {
             .iter()
             .filter_map(|p| match &p.location {
                 Location::Folder(path) => Some((path.clone(), p.icon.clone())),
-                Location::Trash => None,
+                Location::Trash | Location::Network(_) => None,
             })
             .collect();
         special.remove(Path::new("/"));
@@ -340,9 +382,14 @@ impl Files {
             renaming: None,
             location_edit: None,
             location_started: false,
+            location_select: true,
+            network,
+            mounts: Vec::new(),
+            asking: Vec::new(),
+            connecting: None,
             focus_filter: false,
             confirm: None,
-            notice: None,
+            message: None,
             typed: (String::new(), Instant::now()),
             columns: 1,
             origin: egui::Pos2::ZERO,
@@ -356,6 +403,11 @@ impl Files {
         files.apply_skin(ctx);
         if files.config.system_title_bar {
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        }
+        match remote {
+            Some(uri) if network::is_listing(&uri) => files.tabs[0] = Tab::new(Location::Network(uri)),
+            Some(uri) => files.actions.push(Action::OpenUri(uri)),
+            None => {}
         }
         files.load(files.tabs[0].location.clone(), ctx);
         files
@@ -384,7 +436,10 @@ impl Files {
             return;
         }
         self.reading.insert(location.clone());
-        listing::spawn(location, self.mime.clone(), ctx.clone(), self.listed_send.clone());
+        match &location {
+            Location::Network(uri) => self.network.list(uri),
+            _ => listing::spawn(location, self.mime.clone(), ctx.clone(), self.listed_send.clone()),
+        }
     }
 
     /// Takes in finished listings, file changes and finished operations.
@@ -429,6 +484,10 @@ impl Files {
             }
         }
 
+        for event in self.network.events() {
+            self.network_event(event, ctx);
+        }
+
         for changed in self.watcher.changed() {
             if changed == listing::trash_files() || changed.ends_with("Trash/info") {
                 self.load(Location::Trash, ctx);
@@ -439,10 +498,23 @@ impl Files {
             }
         }
 
-        let placed = {
+        let (placed, errors) = {
             let mut status = self.worker.status.lock().unwrap_or_else(|e| e.into_inner());
-            if status.running.is_none() { std::mem::take(&mut status.placed) } else { Vec::new() }
+            if status.running.is_none() {
+                (std::mem::take(&mut status.placed), std::mem::take(&mut status.errors))
+            } else {
+                (Vec::new(), Vec::new())
+            }
         };
+        if let Some(first) = errors.first() {
+            let more = errors.len() - 1;
+            let text = if more > 0 { format!("{first} (and {more} more)") } else { first.clone() };
+            let mut message = Message::error(text);
+            if more > 0 {
+                message.detail = errors;
+            }
+            self.message = Some(message);
+        }
         if !placed.is_empty() {
             let tab = self.current_mut();
             if let Some(folder) = tab.folder().map(Path::to_path_buf) {
@@ -465,7 +537,76 @@ impl Files {
         self.watcher.set(folders);
     }
 
+    fn network_event(&mut self, event: network::Event, ctx: &egui::Context) {
+        match event {
+            network::Event::Mounted { uri, result } => {
+                let name = match self.connecting.take_if(|(u, _)| *u == uri) {
+                    Some((_, name)) => name,
+                    None => return,
+                };
+                match result {
+                    Ok(path) => self.go(Location::Folder(path), ctx),
+                    Err(Some(e)) => self.message = Some(Message::error(format!("Couldn't connect to {name}: {e}"))),
+                    Err(None) => {}
+                }
+            }
+            network::Event::Unmounted { uri, result: Err(Some(e)) } => {
+                let name = self.mounts.iter().find(|m| m.uri == uri).map_or(uri.clone(), |m| m.name.clone());
+                self.message = Some(Message::error(format!("Couldn't unmount {name}: {e}")));
+            }
+            network::Event::Unmounted { .. } => {}
+            network::Event::Mounts(mounts) => {
+                // Tabs in a share that's gone go to its server.
+                let gone: Vec<network::Mount> =
+                    self.mounts.iter().filter(|m| !mounts.iter().any(|n| n.path == m.path)).cloned().collect();
+                self.mounts = mounts;
+                for mount in gone {
+                    for i in 0..self.tabs.len() {
+                        if self.tabs[i].folder().is_some_and(|f| f.starts_with(&mount.path)) {
+                            let shown = std::mem::replace(&mut self.tab, i);
+                            self.go(Location::Network(network::server_of(&mount.uri)), ctx);
+                            self.tab = shown;
+                        }
+                    }
+                }
+            }
+            network::Event::Ask(ask) => {
+                let (user, domain) = match &ask.kind {
+                    network::AskKind::Password { user, domain, .. } => (user.clone(), domain.clone()),
+                    network::AskKind::Question(_) => Default::default(),
+                };
+                self.asking.push(Asking {
+                    ask,
+                    user,
+                    domain,
+                    password: String::new(),
+                    anonymous: false,
+                    save: network::Save::ForSession,
+                    focused: false,
+                });
+            }
+            network::Event::Withdrawn(id) => self.asking.retain(|a| a.ask.id != id),
+        }
+    }
+
+    /// Where Up goes: the enclosing folder; from a share, its server; from
+    /// a server, the network.
+    fn up_from(&self, location: &Location) -> Option<Location> {
+        match location {
+            Location::Trash => None,
+            Location::Network(uri) if uri == network::ROOT => None,
+            Location::Network(_) => Some(Location::Network(network::ROOT.into())),
+            Location::Folder(path) => match self.mounts.iter().find(|m| m.path == *path) {
+                Some(mount) => Some(Location::Network(network::server_of(&mount.uri))),
+                None => path.parent().map(|p| Location::Folder(p.to_path_buf())),
+            },
+        }
+    }
+
     fn icon_source(&self, entry: &Entry) -> Source {
+        if let Some(remote) = &entry.remote {
+            return Source::Theme(remote.icon.clone());
+        }
         match entry.kind {
             Kind::Folder => self.special.get(&entry.path).cloned().unwrap_or_else(|| icons::theme(&["folder"])),
             Kind::App => Source::App(entry.path.clone()),
@@ -480,9 +621,11 @@ impl Files {
         }
     }
 
-    fn title_of(location: &Location) -> String {
+    fn title_of(location: &Location, mounts: &[network::Mount]) -> String {
         match location {
             Location::Trash => "Trash".into(),
+            Location::Network(uri) => network::host(uri).unwrap_or("Network").to_string(),
+            Location::Folder(path) if let Some(mount) = mounts.iter().find(|m| m.path == *path) => mount.name.clone(),
             Location::Folder(path) if Some(path) == dirs::home_dir().as_ref() => "Home".into(),
             Location::Folder(path) if path == Path::new("/") => "Computer".into(),
             Location::Folder(path) => places::name(path),
@@ -517,11 +660,12 @@ impl Files {
                 }
             }
             Action::Up => {
-                if let Some(folder) = self.current().folder().map(Path::to_path_buf)
-                    && let Some(parent) = folder.parent()
-                {
-                    self.go(Location::Folder(parent.to_path_buf()), ctx);
-                    self.current_mut().select_after = vec![folder];
+                let here = self.current().location.clone();
+                if let Some(up) = self.up_from(&here) {
+                    self.go(up, ctx);
+                    if let Location::Folder(folder) = here {
+                        self.current_mut().select_after = vec![folder];
+                    }
                 }
             }
             Action::Click { path, add, range } => self.click(path, add, range),
@@ -536,7 +680,7 @@ impl Files {
             Action::Copy | Action::Cut => {
                 let cut = matches!(action, Action::Cut);
                 let paths: Vec<PathBuf> = self.current().selection().iter().map(|e| e.path.clone()).collect();
-                if !paths.is_empty() && !self.current().in_trash() {
+                if !paths.is_empty() && self.current().folder().is_some() {
                     let text = uri::clipboard_text(&paths, cut);
                     ctx.copy_text(text.clone());
                     self.clip = Some(Clip { paths, cut, text });
@@ -554,7 +698,7 @@ impl Files {
                 let paths: Vec<PathBuf> = self.current().selection().iter().map(|e| e.path.clone()).collect();
                 if self.current().in_trash() {
                     self.apply(Action::Purge, ctx);
-                } else if !paths.is_empty() {
+                } else if !paths.is_empty() && self.current().folder().is_some() {
                     self.select_neighbour();
                     self.worker.start(Op::Trash(paths));
                 }
@@ -588,13 +732,13 @@ impl Files {
                             self.current_mut().rename_after = Some(path);
                             self.load(Location::Folder(folder), ctx);
                         }
-                        Err(e) => self.notice = Some(format!("Can't make a folder here: {e}")),
+                        Err(e) => self.message = Some(Message::error(format!("Can't make a folder here: {e}"))),
                     }
                 }
             }
             Action::Terminal(dir) => {
                 if let Err(e) = spawn_in(&patina_apps::terminal(), &[], &dir) {
-                    self.notice = Some(format!("Can't open a terminal: {e}"));
+                    self.message = Some(Message::error(format!("Can't open a terminal: {e}")));
                 }
             }
             Action::NewWindow => {
@@ -602,7 +746,7 @@ impl Files {
                 let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("files"));
                 let args: Vec<String> = here.iter().map(|p| p.display().to_string()).collect();
                 if let Err(e) = spawn_in(&exe.to_string_lossy(), &args, &dirs::home_dir().unwrap_or_default()) {
-                    self.notice = Some(format!("Can't open a window: {e}"));
+                    self.message = Some(Message::error(format!("Can't open a window: {e}")));
                 }
             }
             Action::Drop { paths, into } => {
@@ -611,6 +755,24 @@ impl Files {
             }
             Action::Move(step) => self.step(step, ctx.input(|i| i.modifiers.shift)),
             Action::Tab(action) => self.tab_action(action, ctx),
+            Action::OpenUri(uri) => {
+                if network::is_listing(&uri) {
+                    self.go(Location::Network(uri), ctx);
+                } else {
+                    let name = uri.split_once("://").map_or(uri.as_str(), |(_, rest)| rest.trim_end_matches('/'));
+                    self.apply(Action::Mount(uri.clone(), name.to_string()), ctx);
+                }
+            }
+            Action::Mount(uri, name) => {
+                self.network.mount(&uri);
+                self.connecting = Some((uri, name));
+            }
+            Action::Unmount(uri) => self.network.unmount(&uri),
+            Action::ConnectToServer => {
+                self.location_started = false;
+                self.location_select = false;
+                self.location_edit = Some("smb://".into());
+            }
             Action::CloseTab => {
                 if self.tabs.len() > 1 {
                     self.tab_action(TabAction::Close(self.tab), ctx);
@@ -632,9 +794,11 @@ impl Files {
             }
             Action::EditLocation => {
                 self.location_started = false;
+                self.location_select = true;
                 self.location_edit = Some(match &self.current().location {
                     Location::Folder(path) => path.display().to_string(),
                     Location::Trash => String::new(),
+                    Location::Network(uri) => uri.clone(),
                 });
             }
             Action::FocusFilter => self.focus_filter = true,
@@ -656,7 +820,6 @@ impl Files {
     fn arrive(&mut self, ctx: &egui::Context) {
         self.renaming = None;
         self.location_edit = None;
-        self.notice = None;
         self.band = None;
         let tab = self.current_mut();
         tab.entries.clear();
@@ -677,8 +840,16 @@ impl Files {
         let Some(entry) = self.current().entries.iter().find(|e| e.path == path).cloned() else {
             return;
         };
+        if let Some(remote) = entry.remote {
+            if network::is_listing(&remote.uri) {
+                self.go(Location::Network(remote.uri), ctx);
+            } else {
+                self.apply(Action::Mount(remote.uri, entry.name), ctx);
+            }
+            return;
+        }
         if entry.trashed.is_some() {
-            self.notice = Some(format!("Put “{}” back to open it.", entry.name));
+            self.message = Some(Message::warn(format!("Put “{}” back to open it.", entry.name)));
             return;
         }
         if self.picking.is_some() {
@@ -698,11 +869,11 @@ impl Files {
             Kind::Folder => self.go(Location::Folder(entry.path), ctx),
             Kind::App => match patina_apps::read(&entry.path).and_then(|app| app.launch().map_err(|e| e.to_string())) {
                 Ok(()) => {}
-                Err(e) => self.notice = Some(format!("Can't open {}: {e}", entry.name)),
+                Err(e) => self.message = Some(Message::error(format!("Can't open {}: {e}", entry.name))),
             },
             Kind::File => {
                 if let Err(e) = patina::open::path(&entry.path) {
-                    self.notice = Some(format!("Can't open {}: {e}", entry.name));
+                    self.message = Some(Message::error(format!("Can't open {}: {e}", entry.name)));
                 }
             }
         }
@@ -863,6 +1034,7 @@ impl Files {
         }
         let into = self.current().location.clone();
         match into {
+            Location::Network(_) => {}
             Location::Trash => self.worker.start(Op::Trash(paths)),
             Location::Folder(into) if cut => {
                 self.worker.start(Op::Move { sources: paths, into });
@@ -876,6 +1048,7 @@ impl Files {
     /// with Ctrl or when it's onto another disk.
     fn drop_into(&mut self, paths: Vec<PathBuf>, into: Location, copy: bool) {
         match into {
+            Location::Network(_) => {}
             Location::Trash => {
                 if !self.current().in_trash() {
                     self.worker.start(Op::Trash(paths));
@@ -895,7 +1068,7 @@ impl Files {
     }
 
     fn start_rename(&mut self, path: &Path) {
-        if self.current().in_trash() {
+        if self.current().folder().is_none() {
             return;
         }
         let Some(entry) = self.current().entries.iter().find(|e| e.path == path) else { return };
@@ -919,7 +1092,7 @@ impl Files {
                 let location = tab.location.clone();
                 self.load(location, ctx);
             }
-            Err(e) => self.notice = Some(e),
+            Err(e) => self.message = Some(Message::error(e)),
         }
     }
 
@@ -949,7 +1122,7 @@ impl Files {
     /// The shortcuts, taken before the widgets see them; none while a text
     /// field has the keys.
     fn keys(&mut self, ctx: &egui::Context) {
-        if ctx.text_edit_focused() || self.renaming.is_some() || self.confirm.is_some() {
+        if ctx.text_edit_focused() || self.renaming.is_some() || self.confirm.is_some() || !self.asking.is_empty() {
             return;
         }
         let mut actions = Vec::new();
@@ -1059,7 +1232,7 @@ impl Files {
             TitleBar::new(&title, style).custom(!self.config.system_title_bar).show(ui, |_| {}, |_| {});
             return;
         }
-        let titles: Vec<String> = self.tabs.iter().map(|t| Self::title_of(&t.location)).collect();
+        let titles: Vec<String> = self.tabs.iter().map(|t| Self::title_of(&t.location, &self.mounts)).collect();
         let mut action = None;
         TitleBar::new("", style).custom(!self.config.system_title_bar).menu_bar(true).show(
             ui,
@@ -1125,7 +1298,9 @@ impl Files {
     fn edit_menu(&mut self, ui: &mut Ui) {
         let tab = self.current();
         let in_trash = tab.in_trash();
-        let count = tab.selected.len();
+        // Servers and shares can't be cut, copied, renamed or trashed.
+        let count = if tab.remote() { 0 } else { tab.selected.len() };
+        let can_paste = self.clip.is_some() && !tab.remote();
         let mut a = Vec::new();
         if in_trash {
             if ui.add_enabled(count > 0, egui::Button::new("Put Back")).clicked() {
@@ -1146,7 +1321,7 @@ impl Files {
                 a.push(Action::Copy);
             }
             let paste = egui::Button::new("Paste").shortcut_text(shortcut(ui, "Ctrl+V"));
-            if ui.add_enabled(self.clip.is_some(), paste).clicked() {
+            if ui.add_enabled(can_paste, paste).clicked() {
                 a.push(Action::Paste(None));
             }
             if ui.add_enabled(count > 0, egui::Button::new("Copy Path")).clicked() {
@@ -1239,7 +1414,7 @@ impl Files {
         {
             a.push(Action::Forward);
         }
-        let up = tab.folder().is_some_and(|f| f.parent().is_some());
+        let up = self.up_from(&tab.location).is_some();
         if ui.add_enabled(up, egui::Button::new("Enclosing Folder").shortcut_text(shortcut(ui, "Alt+Up"))).clicked() {
             a.push(Action::Up);
         }
@@ -1249,28 +1424,44 @@ impl Files {
                 a.push(Action::Go(place.location.clone()));
             }
         }
+        if ui.button("Network").clicked() {
+            a.push(Action::Go(Location::Network(network::ROOT.into())));
+        }
         ui.separator();
+        if ui.button("Connect to Server…").clicked() {
+            a.push(Action::ConnectToServer);
+        }
         if ui.add(egui::Button::new("Location…").shortcut_text(shortcut(ui, "Ctrl+L"))).clicked() {
             a.push(Action::EditLocation);
         }
         self.actions.extend(a);
     }
 
+    /// Patina's skin menu (its ADR-0017): only controls, in the order every Patina app has them;
+    /// what they did goes to the status bar.
     fn skin_menu(&mut self, ui: &mut Ui) {
+        // Size the menu to its widest entry instead of wrapping entries to its first width.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         let ctx = ui.ctx().clone();
         let mut changed = false;
         for (i, skin) in self.skins.iter().enumerate() {
-            let resp = ui.radio_value(&mut self.skin, i, &skin.name);
-            let resp = match (&skin.path, &skin.author) {
-                (Some(path), _) => resp.on_hover_text(path.display().to_string()),
-                (None, Some(author)) => resp.on_hover_text(format!("Built in, by {author}")),
-                (None, None) => resp.on_hover_text("Stock egui"),
+            let label = match &skin.author {
+                Some(author) if skin.path.is_some() => format!("{} — {author}", skin.name),
+                _ => skin.name.clone(),
             };
-            changed |= resp.clicked();
+            let resp = ui.radio(self.skin == i, label);
+            let resp = match &skin.path {
+                Some(path) => resp.on_hover_text(path.display().to_string()),
+                None => resp,
+            };
+            if resp.clicked() {
+                self.skin = i;
+                changed = true;
+            }
         }
         ui.separator();
         ui.add_enabled_ui(self.skins[self.skin].follows_desktop(), |ui| {
-            for (value, label) in [("system", "Follow Desktop"), ("light", "Light"), ("dark", "Dark")] {
+            for (value, label) in [("system", "Follow desktop"), ("light", "Light"), ("dark", "Dark")] {
                 if ui.radio(self.config.light_dark == value, label).clicked() {
                     self.config.light_dark = value.into();
                     changed = true;
@@ -1278,20 +1469,38 @@ impl Files {
             }
         });
         ui.separator();
-        if ui.button("Reload Skins").clicked() {
-            let name = self.skins[self.skin].name.clone();
-            (self.skins, self.skin_errors) = load_skins();
-            self.skin = self.skins.iter().position(|s| s.name == name).unwrap_or(0);
+        if ui.button("Reload skins").clicked() {
+            self.reload_skins();
             changed = true;
         }
-        if let Some(dir) = skin::app_dir(APP)
-            && ui.button("Open Skins Folder").on_hover_text(dir.display().to_string()).clicked()
-        {
-            let _ = std::fs::create_dir_all(&dir);
-            self.actions.push(Action::OpenInNewTab(Location::Folder(dir)));
-        }
-        for error in &self.skin_errors {
-            ui.colored_label(ui.visuals().error_fg_color, error);
+        if let Some(dir) = skin::app_dir(APP) {
+            if ui
+                .button("Copy built-in skins to folder")
+                .on_hover_text("Puts editable copies in the skins folder; never overwrites existing files")
+                .clicked()
+            {
+                self.message = Some(match skin::export_built_ins(&dir, skin::BUILT_IN) {
+                    Ok(export) => {
+                        // The copies share the built-ins' names, so after a reload they're the
+                        // versions in use.
+                        self.reload_skins();
+                        changed = true;
+                        let mut parts = Vec::new();
+                        if !export.copied.is_empty() {
+                            parts.push(format!("Copied {}", export.copied.join(", ")));
+                        }
+                        if !export.skipped.is_empty() {
+                            parts.push(format!("kept your existing {}", export.skipped.join(", ")));
+                        }
+                        Message::info(parts.join("; "))
+                    }
+                    Err(e) => Message::error(format!("Couldn't copy skins: {e}")),
+                });
+            }
+            if ui.button("Open skins folder").on_hover_text(dir.display().to_string()).clicked() {
+                let _ = std::fs::create_dir_all(&dir);
+                self.actions.push(Action::OpenInNewTab(Location::Folder(dir)));
+            }
         }
         if changed {
             self.config.skin = self.skins[self.skin].name.clone();
@@ -1300,12 +1509,19 @@ impl Files {
         }
     }
 
+    /// Loads the skins again, keeping the one in use by name.
+    fn reload_skins(&mut self) {
+        let name = self.skins[self.skin].name.clone();
+        (self.skins, self.skin_errors) = load_skins();
+        self.skin = self.skins.iter().position(|s| s.name == name).unwrap_or(0);
+    }
+
     /// Back, forward and up; the path, or a field to type one; the view's
     /// buttons and the filter.
     fn toolbar(&mut self, ui: &mut Ui) {
         let tab = self.current();
         let (can_back, can_forward) = (!tab.back.is_empty(), !tab.forward.is_empty());
-        let can_up = tab.folder().is_some_and(|f| f.parent().is_some());
+        let can_up = self.up_from(&tab.location).is_some();
         let in_trash = tab.in_trash();
         let has_entries = !tab.entries.is_empty();
         let mut a = Vec::new();
@@ -1363,10 +1579,11 @@ impl Files {
             let all = text.chars().count();
             let resp = ui.add(egui::TextEdit::singleline(text).desired_width(ui.available_width()));
             if !self.location_started {
-                // All of it selected, so typing replaces it.
+                // All of it selected, so typing replaces it, or the cursor at the end.
                 self.location_started = true;
+                let from = if self.location_select { 0 } else { all };
                 if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
-                    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(all))));
+                    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(from), CCursor::new(all))));
                     state.store(ui.ctx(), resp.id);
                 }
                 resp.request_focus();
@@ -1375,7 +1592,10 @@ impl Files {
                 let text = self.location_edit.take().unwrap_or_default();
                 if ui.input(|i| i.key_pressed(Key::Enter)) {
                     let path = expand(&text);
-                    if path.is_dir() {
+                    let text = text.trim();
+                    if text.contains("://") && !text.starts_with("file://") {
+                        a.push(Action::OpenUri(text.to_string()));
+                    } else if path.is_dir() {
                         a.push(Action::Go(Location::Folder(path)));
                     } else if self.picking.is_some() && (path.is_file() || path.parent().is_some_and(Path::is_dir)) {
                         a.push(Action::ChoosePath(path));
@@ -1383,13 +1603,13 @@ impl Files {
                         a.push(Action::Go(Location::Folder(parent.to_path_buf())));
                         self.tabs[self.tab].select_after = vec![path];
                     } else {
-                        self.notice = Some(format!("There's no folder at {}", path.display()));
+                        self.message = Some(Message::error(format!("There's no folder at {}", path.display())));
                     }
                 }
             }
             return;
         }
-        let crumbs = crumbs(&self.current().location);
+        let crumbs = crumbs(&self.current().location, &self.mounts);
         let bar = ui.available_rect_before_wrap();
         let background = ui.interact(bar, ui.id().with("path-bar"), Sense::click());
         if background.double_clicked() {
@@ -1434,7 +1654,7 @@ impl Files {
                 ui.label(egui::RichText::new(heading).small().weak());
                 for place in list {
                     let icon = self.icons.get(&place.icon, px);
-                    let resp = place_row(ui, &place.name, icon, place.location == here);
+                    let resp = place_row(ui, &place.name, icon, place.location == here, 0.0);
                     if resp.clicked() {
                         a.push(Action::Go(place.location.clone()));
                     }
@@ -1444,6 +1664,48 @@ impl Files {
                     drop_target(ui, &resp, &place.location, &mut a);
                 }
                 ui.add_space(10.0);
+            }
+            ui.label(egui::RichText::new("Network").small().weak());
+            let root = Location::Network(network::ROOT.into());
+            let icon = self.icons.get(&icons::theme(&["network-workgroup", "network-server", "folder-remote"]), px);
+            let resp = place_row(ui, "Network", icon, here == root, 0.0);
+            if resp.clicked() {
+                a.push(Action::Go(root.clone()));
+            }
+            if resp.clicked_by(egui::PointerButton::Middle) {
+                a.push(Action::OpenInNewTab(root));
+            }
+            let share_icon = icons::theme(&["folder-remote", "network-server", "folder"]);
+            for mount in &self.mounts {
+                let location = Location::Folder(mount.path.clone());
+                let icon = self.icons.get(&share_icon, px);
+                let resp = place_row(ui, &mount.name, icon, here == location, 28.0).on_hover_text(&mount.uri);
+                // The eject button, on top of the row so it takes its own clicks.
+                let eject = Rect::from_center_size(resp.rect.right_center() - vec2(14.0, 0.0), vec2(22.0, 22.0));
+                let eject = ui.interact(eject, Id::new(("eject", &mount.uri)), Sense::click()).on_hover_text("Unmount");
+                let stroke = if eject.hovered() {
+                    ui.visuals().widgets.hovered.fg_stroke
+                } else {
+                    Stroke::new(1.0, ui.visuals().weak_text_color())
+                };
+                glyphs::paint(ui.painter(), eject.rect, Glyph::Eject, stroke);
+                if eject.clicked() {
+                    a.push(Action::Unmount(mount.uri.clone()));
+                } else if resp.clicked() {
+                    a.push(Action::Go(location.clone()));
+                }
+                if resp.clicked_by(egui::PointerButton::Middle) {
+                    a.push(Action::OpenInNewTab(location.clone()));
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("Open in New Tab").clicked() {
+                        a.push(Action::OpenInNewTab(location.clone()));
+                    }
+                    if ui.button("Unmount").clicked() {
+                        a.push(Action::Unmount(mount.uri.clone()));
+                    }
+                });
+                drop_target(ui, &resp, &location, &mut a);
             }
         });
         self.actions.extend(a);
@@ -1481,9 +1743,8 @@ impl Files {
                 if ui.add(egui::Button::new("Cancel").min_size(vec2(80.0, 0.0))).clicked() {
                     a.push(Action::Cancel);
                 }
-                if let Some(notice) = &self.notice {
-                    let text = egui::RichText::new(notice).color(ui.visuals().error_fg_color);
-                    ui.add(egui::Label::new(text).truncate());
+                if let Some(message) = &self.message {
+                    ui.add(egui::Label::new(message.text(ui)).truncate());
                 }
                 if !picking.request.filters.is_empty() && !picking.request.directory {
                     let filters = &picking.request.filters;
@@ -1505,23 +1766,42 @@ impl Files {
         self.actions.extend(a);
     }
 
+    /// Patina's status bar (its ADR-0016): the version, then the latest message, coloured by its
+    /// level; on the right, what's running and the folder's count. Skins that failed to load stay
+    /// there, ahead of newer messages, until they load.
     fn status_bar(&mut self, ui: &mut Ui) {
         let status = self.worker.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let tab = self.current();
         let visible = tab.visible(self.config.show_hidden).len();
         let selection = tab.selection();
         let items = |n: usize| if n == 1 { "1 item".to_string() } else { format!("{n} items") };
-        let text = if selection.is_empty() {
+        let count = if selection.is_empty() {
             items(visible)
         } else {
             let bytes: u64 = selection.iter().filter(|e| e.kind == Kind::File).map(|e| e.size).sum();
             let size = if bytes > 0 { format!(", {}", listing::human_size(bytes)) } else { String::new() };
             format!("{} of {} selected{size}", selection.len(), visible)
         };
+        let skin_errors = (!self.skin_errors.is_empty()).then(|| {
+            let n = self.skin_errors.len();
+            let mut message = Message::error(format!("Couldn't load {n} skin{}", if n == 1 { "" } else { "s" }));
+            message.detail = self.skin_errors.clone();
+            message
+        });
+        let message = skin_errors.as_ref().or(self.message.as_ref());
         ui.horizontal(|ui| {
-            ui.label(text);
+            // Just the version: the app's name is already in the title bar and the window list.
+            let version = egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")));
+            ui.label(version.color(ui.visuals().weak_text_color()).small());
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                ui.label(count);
+                if let Some((_, name)) = &self.connecting {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(format!("Connecting to {name}…"));
+                }
                 if let Some((label, progress)) = &status.running {
+                    ui.separator();
                     if ui.small_button("Stop").clicked() {
                         self.worker.cancel();
                     }
@@ -1533,22 +1813,16 @@ impl Files {
                     let queued =
                         if status.queued > 0 { format!(" (and {} more)", status.queued) } else { String::new() };
                     ui.label(format!("{label}{queued}"));
-                } else if let Some(message) = self.notice.clone().or_else(|| status.errors.first().cloned()) {
-                    if ui.small_button("Dismiss").clicked() {
-                        self.notice = None;
-                        self.worker.status.lock().unwrap_or_else(|e| e.into_inner()).errors.clear();
-                    }
-                    let more = status.errors.len().saturating_sub(1);
-                    let message = if more > 0 && self.notice.is_none() {
-                        format!("{message} (and {more} more)")
-                    } else {
-                        message
-                    };
-                    let resp = ui.colored_label(ui.visuals().error_fg_color, message);
-                    if status.errors.len() > 1 {
-                        resp.on_hover_text(status.errors.join("\n"));
-                    }
                 }
+                ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+                    if let Some(message) = message {
+                        ui.separator();
+                        let resp = ui.add(egui::Label::new(message.text(ui)).truncate());
+                        if !message.detail.is_empty() {
+                            resp.on_hover_text(message.detail.join("\n"));
+                        }
+                    }
+                });
             });
         });
     }
@@ -1567,8 +1841,16 @@ impl Files {
         let area = ui.available_rect_before_wrap();
         let background = ui.interact(area, ui.id().with("background"), Sense::click_and_drag());
 
-        if visible.is_empty() && tab.loaded {
-            let empty = if tab.in_trash() {
+        if visible.is_empty() && (tab.loaded || tab.remote()) {
+            let empty = if !tab.loaded && tab.location == Location::Network(network::ROOT.into()) {
+                "Looking for servers…"
+            } else if !tab.loaded {
+                "Connecting…"
+            } else if tab.location == Location::Network(network::ROOT.into()) {
+                "No servers found"
+            } else if tab.remote() {
+                "No shared folders"
+            } else if tab.in_trash() {
                 "The Trash is empty"
             } else if tab.filter.is_empty() {
                 "Empty folder"
@@ -1607,7 +1889,14 @@ impl Files {
         let can_paste = self.clip.is_some();
         let mut hidden = self.config.show_hidden;
         let mut a = Vec::new();
+        let remote = self.current().remote();
         background.context_menu(|ui| {
+            if remote {
+                if ui.button("Connect to Server…").clicked() {
+                    a.push(Action::ConnectToServer);
+                }
+                return;
+            }
             if in_trash {
                 if ui.button("Empty Trash…").clicked() {
                     a.push(Action::EmptyTrash);
@@ -1892,7 +2181,7 @@ impl Files {
         for (by, _, w, right) in &columns[1..] {
             let text = match by {
                 SortBy::Size => match entry.kind {
-                    Kind::Folder if entry.trashed.is_none() => {
+                    Kind::Folder if entry.trashed.is_none() && entry.remote.is_none() => {
                         if entry.size == 1 {
                             "1 item".into()
                         } else {
@@ -1938,9 +2227,10 @@ impl Files {
         }
         let tab = self.current();
         let in_trash = tab.in_trash();
+        let remote = tab.remote();
         let count = if selected { tab.selected.len() } else { 1 };
         let selection: Vec<PathBuf> = tab.selection().iter().map(|e| e.path.clone()).collect();
-        if resp.drag_started() && !in_trash {
+        if resp.drag_started() && !in_trash && !remote {
             let paths = if selected {
                 selection
             } else {
@@ -1958,6 +2248,15 @@ impl Files {
 
         let mut a = Vec::new();
         resp.context_menu(|ui| {
+            if let Some(item) = &entry.remote {
+                if ui.button("Open").clicked() {
+                    a.push(Action::Open(entry.path.clone()));
+                }
+                if ui.button("Copy Address").clicked() {
+                    ui.ctx().copy_text(item.uri.clone());
+                }
+                return;
+            }
             if in_trash {
                 if ui.button("Put Back").clicked() {
                     a.push(Action::Restore);
@@ -2079,6 +2378,7 @@ impl Files {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.ask_dialog(ctx);
         let Some(confirm) = &self.confirm else { return };
         let (title, detail) = match confirm {
             Confirm::Purge(items) if items.len() == 1 => {
@@ -2127,10 +2427,102 @@ impl Files {
         }
     }
 
+    /// A server's question: a password, as Nautilus asks for one, or a
+    /// choice such as whether to trust a host.
+    fn ask_dialog(&mut self, ctx: &egui::Context) {
+        let Some(asking) = self.asking.first_mut() else { return };
+        let mut answer = None;
+        let modal = egui::Modal::new(Id::new(("ask", asking.ask.id))).show(ctx, |ui| {
+            ui.set_width(380.0);
+            let mut lines = asking.ask.message.lines().filter(|l| !l.trim().is_empty());
+            ui.heading(lines.next().unwrap_or("Connect"));
+            for line in lines {
+                ui.label(line);
+            }
+            ui.add_space(8.0);
+            match &asking.ask.kind {
+                network::AskKind::Password { need_user, need_domain, need_password, anonymous, can_save, .. } => {
+                    if *anonymous {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut asking.anonymous, false, "Registered user");
+                            ui.radio_value(&mut asking.anonymous, true, "Anonymous");
+                        });
+                        ui.add_space(4.0);
+                    }
+                    ui.add_enabled_ui(!asking.anonymous, |ui| {
+                        // The keys go to the first field that wants something.
+                        let mut focus = !std::mem::replace(&mut asking.focused, true);
+                        egui::Grid::new("credentials").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                            let mut field = |ui: &mut Ui, label: &str, text: &mut String, password: bool| {
+                                ui.label(label);
+                                let resp =
+                                    ui.add(egui::TextEdit::singleline(text).password(password).desired_width(260.0));
+                                if focus && (text.is_empty() || password) {
+                                    resp.request_focus();
+                                    focus = false;
+                                }
+                                ui.end_row();
+                            };
+                            if *need_user {
+                                field(ui, "Username", &mut asking.user, false);
+                            }
+                            if *need_domain {
+                                field(ui, "Domain", &mut asking.domain, false);
+                            }
+                            if *need_password {
+                                field(ui, "Password", &mut asking.password, true);
+                            }
+                        });
+                        if *can_save {
+                            ui.add_space(6.0);
+                            ui.radio_value(&mut asking.save, network::Save::Never, "Forget password immediately");
+                            ui.radio_value(&mut asking.save, network::Save::ForSession, "Remember until you log out");
+                            ui.radio_value(&mut asking.save, network::Save::Permanently, "Remember forever");
+                        }
+                    });
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Connect").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                            answer = Some(network::Answer::Password {
+                                anonymous: asking.anonymous,
+                                user: asking.user.clone(),
+                                domain: asking.domain.clone(),
+                                password: std::mem::take(&mut asking.password),
+                                save: asking.save,
+                            });
+                        }
+                        if ui.button("Cancel").clicked() {
+                            answer = Some(network::Answer::Cancel);
+                        }
+                    });
+                }
+                network::AskKind::Question(choices) => {
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        for (i, choice) in choices.iter().enumerate().rev() {
+                            if ui.button(choice).clicked() {
+                                answer = Some(network::Answer::Choice(i));
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        if modal.should_close() {
+            answer = answer.or(Some(network::Answer::Cancel));
+        }
+        if let Some(answer) = answer {
+            let asking = self.asking.remove(0);
+            if matches!(answer, network::Answer::Cancel) && self.asking.is_empty() {
+                self.connecting = None;
+            }
+            self.network.answer(asking.ask.id, answer);
+        }
+    }
+
     fn update_title(&mut self, ctx: &egui::Context) {
         let title = match &self.picking {
             Some(picking) => picking.request.title(),
-            None => Self::title_of(&self.current().location),
+            None => Self::title_of(&self.current().location, &self.mounts),
         };
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -2231,6 +2623,44 @@ impl eframe::App for Files {
     }
 }
 
+/// A message for the status bar.
+struct Message {
+    level: Level,
+    text: String,
+    /// Shown on hover: what a summary stands for.
+    detail: Vec<String>,
+}
+
+enum Level {
+    Error,
+    Warn,
+    Info,
+}
+
+impl Message {
+    fn error(text: impl Into<String>) -> Self {
+        Message { level: Level::Error, text: text.into(), detail: Vec::new() }
+    }
+
+    fn warn(text: impl Into<String>) -> Self {
+        Message { level: Level::Warn, text: text.into(), detail: Vec::new() }
+    }
+
+    fn info(text: impl Into<String>) -> Self {
+        Message { level: Level::Info, text: text.into(), detail: Vec::new() }
+    }
+
+    /// Small, red for errors, yellow for warnings and weak otherwise.
+    fn text(&self, ui: &Ui) -> egui::RichText {
+        let colour = match self.level {
+            Level::Error => ui.visuals().error_fg_color,
+            Level::Warn => ui.visuals().warn_fg_color,
+            Level::Info => ui.visuals().weak_text_color(),
+        };
+        egui::RichText::new(&self.text).color(colour).small()
+    }
+}
+
 fn load_skins() -> (Vec<Skin>, Vec<String>) {
     skin::load_all(skin::BUILT_IN, &skin::app_dir(APP).into_iter().collect::<Vec<_>>())
 }
@@ -2249,12 +2679,27 @@ fn list_columns(width: f32) -> Vec<(SortBy, &'static str, f32, bool)> {
     columns
 }
 
-/// The path as places to go: from Home when it's inside it, else from the
-/// computer's root.
-fn crumbs(location: &Location) -> Vec<(String, Location)> {
-    let Location::Folder(path) = location else {
-        return vec![("Trash".into(), Location::Trash)];
+/// The path as places to go: from Home when it's inside it, from the
+/// network in a share, else from the computer's root.
+fn crumbs(location: &Location, mounts: &[network::Mount]) -> Vec<(String, Location)> {
+    let network = || ("Network".to_string(), Location::Network(network::ROOT.into()));
+    let path = match location {
+        Location::Trash => return vec![("Trash".into(), Location::Trash)],
+        Location::Network(uri) if uri == network::ROOT => return vec![network()],
+        Location::Network(uri) => {
+            return vec![network(), (network::host(uri).unwrap_or(uri).to_string(), location.clone())];
+        }
+        Location::Folder(path) => path,
     };
+    if let Some(mount) = mounts.iter().find(|m| path.starts_with(&m.path)) {
+        let mut at = mount.path.clone();
+        let mut crumbs = vec![network(), (mount.name.clone(), Location::Folder(at.clone()))];
+        for part in path.strip_prefix(&mount.path).unwrap_or(Path::new("")).components() {
+            at.push(part);
+            crumbs.push((part.as_os_str().to_string_lossy().into_owned(), Location::Folder(at.clone())));
+        }
+        return crumbs;
+    }
     let home = dirs::home_dir();
     let (mut at, mut crumbs, rest) = match home.as_ref().and_then(|h| path.strip_prefix(h).ok().map(|r| (h, r))) {
         Some((home, rest)) => {
@@ -2362,8 +2807,8 @@ fn glyph_toggle(ui: &mut Ui, glyph: Glyph, on: bool, hint: &str) -> Response {
 }
 
 /// A row in the sidebar: the place's icon and name, filled when it's the
-/// tab's location.
-fn place_row(ui: &mut Ui, name: &str, icon: Option<egui::TextureId>, current: bool) -> Response {
+/// tab's location; the name stops `reserve` short of the right, for a button.
+fn place_row(ui: &mut Ui, name: &str, icon: Option<egui::TextureId>, current: bool, reserve: f32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
     let v = ui.visuals();
     let dropping = DragAndDrop::has_payload_of_type::<Dragged>(ui.ctx()) && resp.contains_pointer();
@@ -2381,7 +2826,8 @@ fn place_row(ui: &mut Ui, name: &str, icon: Option<egui::TextureId>, current: bo
         ui.painter().image(icon, icon_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), egui::Color32::WHITE);
     }
     let font = egui::TextStyle::Body.resolve(ui.style());
-    ui.painter_at(rect).text(pos2(icon_rect.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, name, font, colour);
+    let text = rect.with_max_x(rect.right() - reserve);
+    ui.painter_at(text).text(pos2(icon_rect.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, name, font, colour);
     resp
 }
 
@@ -2425,11 +2871,27 @@ mod tests {
     #[test]
     fn crumbs_start_at_home_inside_it() {
         let home = dirs::home_dir().unwrap();
-        let names: Vec<String> = crumbs(&Location::Folder(home.join("a/b"))).into_iter().map(|c| c.0).collect();
+        let names: Vec<String> = crumbs(&Location::Folder(home.join("a/b")), &[]).into_iter().map(|c| c.0).collect();
         assert_eq!(names, ["Home", "a", "b"]);
-        let names: Vec<String> = crumbs(&Location::Folder("/usr/share".into())).into_iter().map(|c| c.0).collect();
+        let names: Vec<String> = crumbs(&Location::Folder("/usr/share".into()), &[]).into_iter().map(|c| c.0).collect();
         assert_eq!(names, ["Computer", "usr", "share"]);
-        assert_eq!(crumbs(&Location::Folder("/usr".into()))[1].1, Location::Folder("/usr".into()));
+        assert_eq!(crumbs(&Location::Folder("/usr".into()), &[])[1].1, Location::Folder("/usr".into()));
+    }
+
+    #[test]
+    fn crumbs_in_a_share_start_at_the_network() {
+        let share = PathBuf::from("/run/user/1000/gvfs/smb-share:server=urd.local,share=music");
+        let mounts = [network::Mount {
+            name: "music on urd.local".into(),
+            uri: "smb://urd.local/music/".into(),
+            path: share.clone(),
+        }];
+        let names: Vec<String> =
+            crumbs(&Location::Folder(share.join("Albums")), &mounts).into_iter().map(|c| c.0).collect();
+        assert_eq!(names, ["Network", "music on urd.local", "Albums"]);
+        let names: Vec<String> =
+            crumbs(&Location::Network("smb://urd.local/".into()), &mounts).into_iter().map(|c| c.0).collect();
+        assert_eq!(names, ["Network", "urd.local"]);
     }
 
     #[test]
