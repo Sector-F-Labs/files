@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+GenericName=File Manager
+Comment=Browse and organise your files; open .app folders as apps
+Exec=files %U
+Icon=com.sectorflabs.Files
+Terminal=false
+StartupWMClass=com.sectorflabs.Files
+Categories=System;Utility;Core;FileManager;
+Keywords=folder;manager;explore;disk;filesystem;
+MimeType=inode/directory;

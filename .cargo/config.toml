@@ -1,0 +1,4 @@
+# patina-apps is a private git repository on remotes.divanv.com; the git
+# command line uses your ssh setup to fetch it.
+[net]
+git-fetch-with-cli = true
