@@ -14,7 +14,7 @@ freedesktop-icons = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 libc = "0.2"
 notify = "7"
-patina-apps = { git = "ssh://divan@remotes.divanv.com/~/Remotes/src/com/sectorflabs/patina-apps", features = ["icon"] }
+patina-apps = { git = "https://github.com/Sector-F-Labs/patina-apps", features = ["icon"] }
 patina-ui = "0.1.9"
 serde = { version = "1", features = ["derive"] }
 toml = "1"

@@ -2609,7 +2609,7 @@ dependencies = [
 [[package]]
 name = "patina-apps"
 version = "0.1.0"
-source = "git+ssh://divan@remotes.divanv.com/~/Remotes/src/com/sectorflabs/patina-apps#1715d4988a2b1f6d6c6b1bd342ed5f55f8e9bb51"
+source = "git+https://github.com/Sector-F-Labs/patina-apps#2b2950acddac821d73d8a34f70f41fcd72f29fb2"
 dependencies = [
  "image",
  "resvg",

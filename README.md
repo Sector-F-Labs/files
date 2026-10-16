@@ -3,7 +3,7 @@
 A [Patina](https://github.com/Sector-F-Labs/patina) file manager, where a `Name.app` folder is an
 app, as on a Mac: shown as one item with its own icon, and run when it's opened (right-click →
 Show Contents to look inside). Apps are folders with an `app.toml` (Patina OS ADR-0004); the
-rules come from the shared [patina-apps](../patina-apps) crate, which the Patina desktop's
+rules come from the shared [patina-apps](https://github.com/Sector-F-Labs/patina-apps) crate, which the Patina desktop's
 launcher uses too. It runs on any Linux desktop (and FreeBSD), so `.app` folders work wherever
 Files is installed.
 
@@ -30,7 +30,7 @@ make install-portal   # be the file chooser in the Patina session (root; SUDO=do
 make app          # or target/Files.app, to copy into ~/Apps
 ```
 
-It depends on patina-apps by git over ssh (`.cargo/config.toml` has `git-fetch-with-cli`).
+It depends on [patina-apps](https://github.com/Sector-F-Labs/patina-apps) and Patina from GitHub.
 
 ## Develop
 
