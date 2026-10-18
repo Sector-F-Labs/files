@@ -146,7 +146,7 @@ fn thumbnail(path: &std::path::Path, px: u32) -> Option<Vec<u8>> {
     if ext == "svg" {
         return patina_apps::icon::svg(&std::fs::read(path).ok()?, px);
     }
-    let image = image::open(path).ok()?;
+    let image = crate::preview::open(path).ok()?;
     let fitted = image.thumbnail(px, px).into_rgba8();
     let (w, h) = fitted.dimensions();
     let mut square = image::RgbaImage::new(px, px);

@@ -28,6 +28,7 @@ use crate::mime::Mime;
 use crate::network::{self, Network};
 use crate::ops::{self, Op};
 use crate::places::{self, Place};
+use crate::preview::{self, Previews};
 use crate::uri;
 use crate::watch::Watcher;
 
@@ -42,6 +43,12 @@ const ROW: f32 = 24.0;
 const ROW_ICON: f32 = 16.0;
 /// The sidebar's icons.
 const PLACE_ICON: f32 = 16.0;
+/// Quick Look's window: its app id, so the desktop keeps its place apart
+/// from the folder windows', and its size the first time.
+const QUICK_LOOK_ID: &str = "com.sectorflabs.Files.QuickLook";
+const QUICK_LOOK_SIZE: [f32; 2] = [720.0, 540.0];
+/// Its icon, for what isn't a picture.
+const QUICK_LOOK_ICON: f32 = 128.0;
 /// How long typed letters keep adding to the name they find.
 const TYPE_AHEAD: Duration = Duration::from_millis(1000);
 
@@ -251,6 +258,8 @@ enum Action {
     ToggleHidden,
     EditLocation,
     FocusFilter,
+    /// Space: shows the selected item large in a window of its own, or closes it.
+    QuickLook,
 }
 
 pub struct Files {
@@ -272,6 +281,9 @@ pub struct Files {
     tab: usize,
     mime: Arc<Mime>,
     icons: Icons,
+    previews: Previews,
+    /// Quick Look is showing the item at the cursor (ADR-0008).
+    looking: bool,
     places: Vec<Place>,
     disks: Vec<Place>,
     /// Folders with their own icon: home, Apps, Documents and the rest.
@@ -392,6 +404,8 @@ impl Files {
             tab: 0,
             mime: Arc::new(Mime::load()),
             icons: Icons::new(ctx),
+            previews: Previews::new(ctx),
+            looking: false,
             places,
             disks: places::disks(),
             special,
@@ -468,6 +482,7 @@ impl Files {
     /// Takes in finished listings, file changes and finished operations.
     fn poll(&mut self, ctx: &egui::Context) {
         self.icons.poll(ctx);
+        self.previews.poll(ctx);
         while let Ok(Listed { location, entries }) = self.listed.try_recv() {
             self.reading.remove(&location);
             if self.stale.remove(&location) {
@@ -659,7 +674,11 @@ impl Files {
 
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
         match action {
-            Action::Open(path) => self.open(&path, ctx),
+            Action::Open(path) => {
+                self.looking = false;
+                self.open(&path, ctx);
+            }
+            Action::QuickLook => self.looking = !self.looking && self.looked_at().is_some(),
             Action::OpenInNewTab(location) => {
                 self.tabs.insert(self.tab + 1, Tab::new(location.clone()));
                 self.load(location, ctx);
@@ -1154,12 +1173,21 @@ impl Files {
         let page = if self.config.view == View::Icons { columns * 4 } else { 12 };
         let in_trash = self.current().in_trash();
         let picking = self.picking.is_some();
+        let looking = self.looking;
+        // A space goes on with a name being typed, else it's Quick Look;
+        // then the text the key also makes isn't typed.
+        let typing = !self.typed.0.is_empty() && self.typed.1.elapsed() < TYPE_AHEAD;
+        let mut looked = false;
         ctx.input_mut(|i| {
             i.events.retain(|event| {
                 let action = match event {
                     Event::Copy => Action::Copy,
                     Event::Cut => Action::Cut,
                     Event::Paste(text) => Action::Paste(Some(text.clone())),
+                    Event::Text(text) if looked && text == " " => {
+                        looked = false;
+                        return false;
+                    }
                     Event::Text(text) if !text.chars().any(char::is_control) => {
                         typed.push_str(text);
                         return false;
@@ -1167,6 +1195,11 @@ impl Files {
                     Event::Key { key, pressed: true, modifiers: m, .. } => {
                         let plain = !m.command && !m.alt;
                         match key {
+                            Key::Space if plain && !typing => {
+                                looked = true;
+                                Action::QuickLook
+                            }
+                            Key::Escape if looking => Action::QuickLook,
                             Key::Enter if plain && picking => Action::Accept,
                             Key::Escape if picking => Action::Cancel,
                             Key::N | Key::T | Key::W | Key::Q if picking && m.command && !m.shift => return true,
@@ -1295,6 +1328,10 @@ impl Files {
             && let Some(e) = one
         {
             a.push(Action::Open(e.path.clone()));
+        }
+        let quick_look = egui::Button::selectable(self.looking, "Quick Look").shortcut_text(shortcut(ui, "Space"));
+        if ui.add_enabled(!selection.is_empty(), quick_look).clicked() {
+            a.push(Action::QuickLook);
         }
         if let Some(e) = one.filter(|e| e.kind == Kind::App)
             && ui.button("Show Contents").clicked()
@@ -2526,6 +2563,153 @@ impl Files {
         }
     }
 
+    // ---- Quick Look ----
+
+    /// What Quick Look shows: the item at the cursor, or the first selected.
+    fn looked_at(&self) -> Option<&Entry> {
+        let tab = self.current();
+        match tab.cursor.as_ref().filter(|c| tab.selected.contains(*c)) {
+            Some(cursor) => tab.entries.iter().find(|e| &e.path == cursor),
+            None => tab.entries.iter().find(|e| tab.selected.contains(&e.path)),
+        }
+    }
+
+    /// Quick Look (ADR-0008): the item at the cursor in a window of its
+    /// own, a picture drawn to fit and anything else as its icon. The folder's
+    /// keys work in it too, so the arrow keys step through the folder and the
+    /// window follows.
+    fn quick_look(&mut self, ctx: &egui::Context) {
+        // A name being edited (F2, a new folder) wants the keys back.
+        if self.renaming.is_some() {
+            self.looking = false;
+        }
+        if !self.looking {
+            return;
+        }
+        let Some(entry) = self.looked_at().cloned() else {
+            self.looking = false;
+            return;
+        };
+        let custom = !self.config.system_title_bar;
+        let builder = frame::viewport(
+            egui::ViewportBuilder::default()
+                .with_title(entry.name.clone())
+                .with_app_id(QUICK_LOOK_ID)
+                .with_inner_size(QUICK_LOOK_SIZE)
+                .with_min_inner_size([320.0, 240.0]),
+            custom,
+        );
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(QUICK_LOOK_ID), builder, |ui, _| {
+            self.quick_look_window(ui, &entry, custom)
+        });
+    }
+
+    fn quick_look_window(&mut self, ui: &mut Ui, entry: &Entry, custom: bool) {
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.looking = false;
+            return;
+        }
+        self.keys(&ctx);
+        let style = self.skins[self.skin].frame_style(ui.visuals());
+        let radius = if custom { frame::corner_radius(&ctx, style.radius) } else { 0 };
+        let ppp = ctx.pixels_per_point();
+        let icon = self.icons.get(&self.icon_source(entry), (QUICK_LOOK_ICON * ppp).round() as u32);
+        // Decoded at the screen's size, so a maximised window is sharp.
+        let screen = ctx.input(|i| i.viewport().monitor_size).map_or(2048.0, |s| s.max_elem() * ppp);
+        let mut px = screen.round().clamp(1024.0, 4096.0) as u32;
+        if entry.mime.as_deref() == Some("image/svg+xml") {
+            // Drawn for the window instead, having no size of its own: in
+            // steps, so resizing doesn't draw it again each frame. Kept to
+            // 1024: resvg takes most of a second for a large one.
+            let window = ctx.content_rect().size().max_elem() * ppp;
+            px = ((window / 256.0).ceil() as u32 * 256).clamp(256, 1024);
+        }
+        let picture = entry.kind == Kind::File
+            && entry.remote.is_none()
+            && entry.mime.as_deref().is_some_and(icons::has_thumbnail);
+        // None while it's loading; an error shows the icon instead.
+        let shown = picture.then(|| match self.previews.get(&entry.path, entry.modified, px) {
+            preview::State::Loading => None,
+            preview::State::Ready(p) => Some(Ok((p.texture.id(), p.drawn, p.size))),
+            preview::State::Failed(e) => Some(Err(e.to_string())),
+        });
+
+        let mut details = vec![entry.describe.clone()];
+        match entry.kind {
+            Kind::Folder => {
+                details.push(if entry.size == 1 { "1 item".into() } else { format!("{} items", entry.size) })
+            }
+            Kind::File => details.push(listing::human_size(entry.size)),
+            Kind::App => {}
+        }
+        if let Some(Some(Ok((_, _, Some([w, h]))))) = &shown {
+            details.push(format!("{w} × {h}"));
+        }
+        if let Some(modified) = entry.modified {
+            details.push(when(modified));
+        }
+
+        let mut a = Vec::new();
+        let header = frame::header_frame(ui.style(), &style, radius);
+        egui::Panel::top("quick-look-header").frame(header).show(ui, |ui| {
+            TitleBar::new(&entry.name, &style).custom(custom).show(
+                ui,
+                |_| {},
+                |ui| {
+                    if ui.button("Open").on_hover_text("Enter").clicked() {
+                        a.push(Action::Open(entry.path.clone()));
+                    }
+                },
+            );
+        });
+        egui::Panel::bottom("quick-look-details")
+            .frame(
+                egui::Frame::side_top_panel(ui.style())
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .corner_radius(CornerRadius { sw: radius, se: radius, ..Default::default() }),
+            )
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(details.join(" · ")).weak()).truncate());
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(8)))
+            .show(ui, |ui| {
+                let body = ui.available_rect_before_wrap();
+                match &shown {
+                    Some(None) => {
+                        // Its icon (the folder's thumbnail) until it's ready.
+                        let at = Rect::from_center_size(body.center(), vec2(QUICK_LOOK_ICON, QUICK_LOOK_ICON));
+                        if let Some(icon) = icon {
+                            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                            ui.painter().image(icon, at, uv, egui::Color32::WHITE);
+                        }
+                        let below = Rect::from_center_size(at.center_bottom() + vec2(0.0, 24.0), vec2(20.0, 20.0));
+                        ui.put(below, egui::Spinner::new());
+                    }
+                    Some(Some(Ok((texture, drawn, size)))) => {
+                        // At its own size, or smaller to fit; never larger.
+                        let natural = size.map_or(*drawn, |[w, h]| vec2(w as f32, h as f32)) / ppp;
+                        let scale = (body.width() / natural.x).min(body.height() / natural.y).min(1.0);
+                        let shown = Rect::from_center_size(body.center(), natural * scale);
+                        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                        ui.painter().image(*texture, shown, uv, egui::Color32::WHITE);
+                    }
+                    _ => {
+                        let failed = match &shown {
+                            Some(Some(Err(e))) => Some(e.as_str()),
+                            _ => None,
+                        };
+                        quick_look_card(ui, body, icon, &entry.name, failed);
+                    }
+                }
+            });
+        self.actions.extend(a);
+        if custom {
+            frame::edges(&ctx, radius, style.border);
+        }
+    }
+
     /// A server's question: a password, as Nautilus asks for one, or a
     /// choice such as whether to trust a host.
     fn ask_dialog(&mut self, ctx: &egui::Context) {
@@ -2696,6 +2880,7 @@ impl eframe::App for Files {
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(4)))
             .show(ui, |ui| self.items(ui));
 
+        self.quick_look(&ctx);
         self.drag_out(&ctx);
         self.drag_ghost(&ctx);
         self.dialogs(&ctx);
@@ -2892,6 +3077,25 @@ fn local_offset() -> i64 {
 
 fn shortcut(ui: &Ui, text: &str) -> egui::RichText {
     egui::RichText::new(text).color(ui.visuals().weak_text_color())
+}
+
+/// Quick Look for what isn't a picture: its icon and name in the middle of
+/// `body`, with why a picture couldn't be shown.
+fn quick_look_card(ui: &mut Ui, body: Rect, icon: Option<egui::TextureId>, name: &str, failed: Option<&str>) {
+    let card = Rect::from_center_size(body.center(), vec2(body.width().min(420.0), QUICK_LOOK_ICON + 60.0));
+    ui.scope_builder(UiBuilder::new().max_rect(card).layout(egui::Layout::top_down(Align::Center)), |ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(QUICK_LOOK_ICON, QUICK_LOOK_ICON), Sense::hover());
+        if let Some(icon) = icon {
+            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            ui.painter().image(icon, rect, uv, egui::Color32::WHITE);
+        }
+        ui.add_space(8.0);
+        ui.add(egui::Label::new(egui::RichText::new(name).heading()).wrap());
+        if let Some(e) = failed {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("Can't preview it: {e}")).weak().small());
+        }
+    });
 }
 
 fn glyph_button(ui: &mut Ui, glyph: Glyph, enabled: bool, hint: &str) -> Response {

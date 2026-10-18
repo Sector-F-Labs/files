@@ -9,6 +9,8 @@ Files is installed.
 
 - Folders as icons or a list (Ctrl+1, Ctrl+2), in tabs, with a sidebar of places and disks.
 - Thumbnails for pictures; icons from the desktop's icon theme by file type.
+- Quick Look: Space shows the selected picture large in a window of its own (anything else as
+  its icon and details); the arrow keys step through the folder, Space or Escape closes it.
 - Copy, cut and paste (on the clipboard in Nautilus's form, so the two paste each other's), drag
   to move (Ctrl to copy; another disk copies), rename in place (F2), new folder (Ctrl+Shift+N).
 - Drag files between Files windows, out into other apps (Telegram, a browser, Nautilus) and in

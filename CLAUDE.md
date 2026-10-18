@@ -32,6 +32,9 @@ lost). `pgrep -f` matches your own shell: find processes with `pgrep -x files`.
 - `src/ops.rs`: copy, move, trash, restore and purge on one worker thread with progress and
   Stop; free names ("name copy"), new folder, rename.
 - `src/icons.rs`: theme icons, app icons and thumbnails on a thread, newest request first.
+- `src/preview.rs`: Quick Look's pictures (ADR-0008), decoded at screen size on a thread, newest
+  only, EXIF-turned (`open`, which thumbnails use too). Its window is an immediate viewport,
+  `Files::quick_look`, which runs `keys` on its own input.
 - `src/mime.rs`: types from shared-mime-info's `globs2`, icon names, descriptions.
 - `src/portal.rs`: `files --portal`, the `org.freedesktop.impl.portal.FileChooser` service;
   each request runs `files --choose` (a process per dialog: one winit loop per process).

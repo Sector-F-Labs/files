@@ -15,6 +15,7 @@ mod network;
 mod ops;
 mod places;
 mod portal;
+mod preview;
 mod uri;
 mod watch;
 
