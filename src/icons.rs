@@ -164,17 +164,20 @@ fn thumbnail(path: &std::path::Path, px: u32) -> Option<Vec<u8>> {
 }
 
 /// The desktop's icon theme: GNOME's setting where there is one and it's
-/// installed, else Adwaita, falling back to hicolor as the spec says. A
+/// installed (Settings' Appearance page sets it), else Yaru, else Adwaita,
+/// falling back to hicolor as the spec says. A
 /// setting left behind by a removed desktop (breeze-dark, once KDE went)
 /// would leave only hicolor, which has no folders or file types.
 fn icon_theme() -> String {
+    let dirs = icon_dirs();
     std::process::Command::new("gsettings")
         .args(["get", "org.gnome.desktop.interface", "icon-theme"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().trim_matches('\'').to_string())
-        .filter(|t| !t.is_empty() && installed(t, &icon_dirs()))
+        .filter(|t| !t.is_empty() && installed(t, &dirs))
+        .or_else(|| ["Yaru", "Adwaita"].into_iter().find(|t| installed(t, &dirs)).map(String::from))
         .unwrap_or_else(|| "Adwaita".into())
 }
 
