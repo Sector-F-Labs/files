@@ -163,63 +163,13 @@ fn thumbnail(path: &std::path::Path, px: u32) -> Option<Vec<u8>> {
     )
 }
 
-/// The desktop's icon theme: GNOME's setting where there is one and it's
-/// installed (Settings' Appearance page sets it), else Yaru, else Adwaita,
-/// falling back to hicolor as the spec says. A
-/// setting left behind by a removed desktop (breeze-dark, once KDE went)
-/// would leave only hicolor, which has no folders or file types.
+/// The icon theme chosen in Patina's Settings, where it's installed, else
+/// Yaru, else Adwaita (`patina_apps::icon::theme`).
 fn icon_theme() -> String {
-    let dirs = icon_dirs();
-    std::process::Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.interface", "icon-theme"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().trim_matches('\'').to_string())
-        .filter(|t| !t.is_empty() && installed(t, &dirs))
-        .or_else(|| ["Yaru", "Adwaita"].into_iter().find(|t| installed(t, &dirs)).map(String::from))
-        .unwrap_or_else(|| "Adwaita".into())
-}
-
-/// Where icon themes are, as the spec looks: `~/.icons`, then `icons` in
-/// each XDG data directory.
-fn icon_dirs() -> Vec<std::path::PathBuf> {
-    let env = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
-    let home = env("HOME").map(std::path::PathBuf::from);
-    let data_home = env("XDG_DATA_HOME").map(std::path::PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".local/share")));
-    let data_dirs = env("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".into());
-    home.map(|h| h.join(".icons"))
-        .into_iter()
-        .chain(data_home.map(|d| d.join("icons")))
-        .chain(std::env::split_paths(&data_dirs).map(|d| d.join("icons")))
-        .collect()
-}
-
-/// Whether theme `name` is in one of `dirs`: a folder of that name with an
-/// index.theme.
-fn installed(name: &str, dirs: &[std::path::PathBuf]) -> bool {
-    dirs.iter().any(|d| d.join(name).join("index.theme").is_file())
+    patina_apps::icon::theme()
 }
 
 /// Whether a file of type `mime` gets a thumbnail.
 pub fn has_thumbnail(mime: &str) -> bool {
     matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp" | "image/svg+xml")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_theme_counts_only_where_its_index_is() {
-        let dir = std::env::temp_dir().join(format!("files-icons-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("Adwaita")).unwrap();
-        std::fs::write(dir.join("Adwaita/index.theme"), "[Icon Theme]\n").unwrap();
-        std::fs::create_dir_all(dir.join("breeze-dark")).unwrap();
-        let dirs = [dir.clone()];
-        assert!(installed("Adwaita", &dirs));
-        assert!(!installed("breeze-dark", &dirs), "a folder left behind, without its index");
-        assert!(!installed("Yaru", &dirs));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 }
