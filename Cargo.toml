@@ -17,7 +17,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 libc = "0.2"
 notify = "7"
 patina-apps = { git = "https://github.com/Sector-F-Labs/patina-apps", features = ["icon"] }
-patina-ui = "0.1.9"
+patina-ui = { git = "https://github.com/Sector-F-Labs/patina", branch = "develop" }
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 toml = "1"

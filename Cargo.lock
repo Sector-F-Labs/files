@@ -2743,9 +2743,8 @@ dependencies = [
 
 [[package]]
 name = "patina-ui"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e378c96c5f91baafc680911141e84ed459a3a0bb90d268c4d0556274e0872ada"
+version = "0.1.10"
+source = "git+https://github.com/Sector-F-Labs/patina?branch=develop#f0e4905c5b8c2a25cdb5e79382d51722039da99d"
 dependencies = [
  "dirs 7.0.0",
  "egui",
