@@ -12,6 +12,7 @@ pub enum Glyph {
     Separator,
     Icons,
     List,
+    Columns,
     /// Unmounting a share.
     Eject,
 }
@@ -37,6 +38,18 @@ pub fn paint(painter: &Painter, rect: Rect, glyph: Glyph, stroke: Stroke) {
                 painter.rect_stroke(
                     Rect::from_center_size(centre, vec2(cell, cell)),
                     1.0,
+                    Stroke::new(1.2, stroke.color),
+                    egui::StrokeKind::Middle,
+                );
+            }
+        }
+        Glyph::Columns => {
+            let (w, h) = (s * 0.75, s * 2.0);
+            for dx in [-1.0, 0.0, 1.0] {
+                let centre = c + vec2(dx * w, 0.0);
+                painter.rect_stroke(
+                    Rect::from_center_size(centre, vec2(w, h)),
+                    0.0,
                     Stroke::new(1.2, stroke.color),
                     egui::StrokeKind::Middle,
                 );

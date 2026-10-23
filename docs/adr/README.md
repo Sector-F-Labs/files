@@ -51,3 +51,4 @@ mechanics of adding one.
 | [0007](0007-drops-from-other-apps.md) | Files takes other apps' drags of files, so files can be dragged between Files windows | Accepted |
 | [0008](0008-quick-look.md) | Quick Look: Space shows the selected item in a window of its own | Accepted |
 | [0009](0009-taken-names-are-asked-about.md) | A name that's taken is asked about, as Nautilus does: folders merge, a replaced item goes to the Trash | Accepted |
+| [0010](0010-the-column-view.md) | The column view: the tab's folder is the column with the keys, the others are read beside it | Accepted |

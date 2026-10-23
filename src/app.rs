@@ -42,6 +42,10 @@ const CELL: egui::Vec2 = vec2(104.0, 104.0);
 /// The list view's rows and their icons.
 const ROW: f32 = 24.0;
 const ROW_ICON: f32 = 16.0;
+/// The column view's columns, and the preview at their end.
+const COLUMN: f32 = 220.0;
+const PREVIEW: f32 = 260.0;
+const PREVIEW_ICON: f32 = 128.0;
 /// The sidebar's icons.
 const PLACE_ICON: f32 = 16.0;
 /// Quick Look's window: its app id, so the desktop keeps its place apart
@@ -121,15 +125,17 @@ impl Tab {
     /// The entries shown: hidden ones only when asked, and only those the
     /// filter matches, as indices into `entries`.
     fn visible(&self, show_hidden: bool) -> Vec<usize> {
-        let filter = self.filter.trim().to_lowercase();
-        (0..self.entries.len())
-            .filter(|&i| {
-                let e = &self.entries[i];
-                let typed =
-                    e.kind != Kind::File || self.types.as_ref().is_none_or(|t| t.matches(&e.name, e.mime.as_deref()));
-                typed && (show_hidden || !e.hidden) && (filter.is_empty() || e.name.to_lowercase().contains(&filter))
-            })
-            .collect()
+        shown(&self.entries, show_hidden, &self.filter, self.types.as_ref())
+    }
+
+    /// Selects what `select_after` is waiting for, if it's listed now.
+    fn settle(&mut self) {
+        let wanted: Vec<PathBuf> =
+            self.select_after.iter().filter(|p| self.entries.iter().any(|e| &e.path == *p)).cloned().collect();
+        if !wanted.is_empty() {
+            self.select_only(wanted);
+            self.select_after.clear();
+        }
     }
 
     fn selection(&self) -> Vec<&Entry> {
@@ -244,6 +250,14 @@ enum Action {
         into: Location,
     },
     Move(isize),
+    /// In the column view: makes another column's folder the tab's, with
+    /// that item selected.
+    Column {
+        folder: PathBuf,
+        select: Option<PathBuf>,
+    },
+    /// Right in the column view: into the folder selected, at its first item.
+    IntoColumn,
     Tab(TabAction),
     /// A typed URI that isn't a file's: a server to list or a share to mount.
     OpenUri(String),
@@ -334,6 +348,10 @@ pub struct Files {
     band: Option<(egui::Pos2, HashSet<PathBuf>)>,
     /// The item area's scroll offset and height, last frame.
     viewport: (f32, f32),
+    /// The column view's other folders, read; an error if one can't be.
+    column_lists: HashMap<PathBuf, Result<Vec<Entry>, String>>,
+    /// The folders it showed last frame, to bring new ones into view.
+    shown_columns: Vec<PathBuf>,
     actions: Vec<Action>,
     title: String,
     screenshot: Option<(PathBuf, bool)>,
@@ -444,6 +462,8 @@ impl Files {
             origin: egui::Pos2::ZERO,
             band: None,
             viewport: (0.0, 0.0),
+            column_lists: HashMap::new(),
+            shown_columns: Vec::new(),
             actions: Vec::new(),
             title: String::new(),
             screenshot: std::env::var_os("FILES_SCREENSHOT").map(|p| (PathBuf::from(p), false)),
@@ -495,10 +515,20 @@ impl Files {
     fn poll(&mut self, ctx: &egui::Context) {
         self.icons.poll(ctx);
         self.previews.poll(ctx);
+        let wanted = self.wanted_columns();
         while let Ok(Listed { location, entries }) = self.listed.try_recv() {
             self.reading.remove(&location);
             if self.stale.remove(&location) {
                 self.load(location.clone(), ctx);
+            }
+            if let Location::Folder(folder) = &location
+                && wanted.contains(folder)
+            {
+                let mut entries = entries.clone();
+                if let Ok(entries) = &mut entries {
+                    listing::sort(entries, self.config.sort);
+                }
+                self.column_lists.insert(folder.clone(), entries);
             }
             let renaming = self.renaming.is_some();
             let mut rename = None;
@@ -517,11 +547,7 @@ impl Files {
                 }
                 let present: HashSet<PathBuf> = tab.entries.iter().map(|e| e.path.clone()).collect();
                 tab.selected.retain(|p| present.contains(p));
-                let wanted: Vec<PathBuf> = tab.select_after.iter().filter(|p| present.contains(*p)).cloned().collect();
-                if !wanted.is_empty() {
-                    tab.select_only(wanted);
-                    tab.select_after.clear();
-                }
+                tab.settle();
                 if let Some(path) = tab.rename_after.take_if(|p| present.contains(p))
                     && !renaming
                 {
@@ -583,8 +609,58 @@ impl Files {
             }
             folders.insert(files);
         }
+        // The other columns' folders: read when they're first shown, and
+        // forgotten when they're not.
+        self.column_lists.retain(|folder, _| wanted.contains(folder));
+        for folder in wanted {
+            let location = Location::Folder(folder.clone());
+            if !self.column_lists.contains_key(&folder) && !self.reading.contains(&location) {
+                self.load(location, ctx);
+            }
+            folders.insert(folder);
+        }
         folders.extend(places::mount_dirs());
         self.watcher.set(folders);
+    }
+
+    /// Whether the folder is shown in columns: the Trash and the network
+    /// are always a list.
+    fn in_columns(&self) -> bool {
+        self.config.view == View::Columns && self.current().folder().is_some()
+    }
+
+    /// The folders left of this one in the column view, from where its path
+    /// starts (Home, the computer or a share), as the path bar has them.
+    fn column_chain(&self) -> Vec<PathBuf> {
+        let mut chain: Vec<PathBuf> = crumbs(&self.current().location, &self.mounts)
+            .into_iter()
+            .filter_map(|(_, location)| match location {
+                Location::Folder(path) => Some(path),
+                Location::Trash | Location::Network(_) => None,
+            })
+            .collect();
+        chain.pop();
+        chain
+    }
+
+    /// The one folder selected, whose items are the column on the right.
+    fn selected_folder(&self) -> Option<PathBuf> {
+        match self.current().selection()[..] {
+            [entry] if entry.is_folder() => Some(entry.path.clone()),
+            _ => None,
+        }
+    }
+
+    /// The folders the column view lists apart from the tab's own: those to
+    /// its left, itself (for when it's one of those), and the one selected.
+    fn wanted_columns(&self) -> HashSet<PathBuf> {
+        if !self.in_columns() {
+            return HashSet::new();
+        }
+        let mut wanted: HashSet<PathBuf> = self.column_chain().into_iter().collect();
+        wanted.extend(self.current().folder().map(Path::to_path_buf));
+        wanted.extend(self.selected_folder());
+        wanted
     }
 
     fn network_event(&mut self, event: network::Event, ctx: &egui::Context) {
@@ -718,7 +794,10 @@ impl Files {
                 if let Some(up) = self.up_from(&here) {
                     self.go(up, ctx);
                     if let Location::Folder(folder) = here {
-                        self.current_mut().select_after = vec![folder];
+                        let tab = self.current_mut();
+                        tab.select_after = vec![folder];
+                        // Already listed when it's a column.
+                        tab.settle();
                     }
                 }
             }
@@ -808,6 +887,27 @@ impl Files {
                 self.drop_into(paths, into, copy);
             }
             Action::Move(step) => self.step(step, ctx.input(|i| i.modifiers.shift)),
+            Action::Column { folder, select } => {
+                self.go(Location::Folder(folder), ctx);
+                match select {
+                    Some(path) => {
+                        self.click(path.clone(), false, false);
+                        self.current_mut().scroll_to = Some(path);
+                    }
+                    None => self.current_mut().selected.clear(),
+                }
+            }
+            Action::IntoColumn => {
+                let Some(folder) = self.selected_folder() else { return };
+                let show_hidden = self.config.show_hidden;
+                let first = match self.column_lists.get(&folder) {
+                    Some(Ok(entries)) => shown(entries, show_hidden, "", self.current().types.as_ref())
+                        .first()
+                        .map(|&i| entries[i].path.clone()),
+                    _ => None,
+                };
+                self.apply(Action::Column { folder, select: first }, ctx);
+            }
             Action::Tab(action) => self.tab_action(action, ctx),
             Action::OpenUri(uri) => {
                 if network::is_listing(&uri) {
@@ -896,6 +996,14 @@ impl Files {
         tab.select_after.clear();
         tab.filter.clear();
         let location = tab.location.clone();
+        // A column's folder is already read, so it's shown at once.
+        if let Location::Folder(folder) = &location
+            && let Some(Ok(entries)) = self.column_lists.get(folder)
+        {
+            let tab = &mut self.tabs[self.tab];
+            tab.entries = entries.clone();
+            tab.loaded = true;
+        }
         self.load(location, ctx);
     }
 
@@ -1198,6 +1306,7 @@ impl Files {
         let mut actions = Vec::new();
         let mut typed = String::new();
         let columns = if self.config.view == View::Icons { self.columns as isize } else { 1 };
+        let in_columns = self.in_columns();
         let page = if self.config.view == View::Icons { columns * 4 } else { 12 };
         let in_trash = self.current().in_trash();
         let picking = self.picking.is_some();
@@ -1248,6 +1357,8 @@ impl Files {
                             },
                             Key::Home if m.alt => Action::Go(Location::Folder(dirs::home_dir().unwrap_or_default())),
                             Key::Backspace if plain => Action::Up,
+                            Key::ArrowLeft if plain && in_columns => Action::Up,
+                            Key::ArrowRight if plain && in_columns => Action::IntoColumn,
                             Key::ArrowLeft if plain && columns > 1 => Action::Move(-1),
                             Key::ArrowRight if plain && columns > 1 => Action::Move(1),
                             Key::ArrowUp if plain => Action::Move(-columns),
@@ -1276,6 +1387,7 @@ impl Files {
                             Key::F if m.command => Action::FocusFilter,
                             Key::Num1 if m.command => Action::SetView(View::Icons),
                             Key::Num2 if m.command => Action::SetView(View::List),
+                            Key::Num3 if m.command => Action::SetView(View::Columns),
                             _ => return true,
                         }
                     }
@@ -1455,6 +1567,12 @@ impl Files {
         {
             a.push(Action::SetView(View::List));
         }
+        if ui
+            .add(egui::Button::selectable(view == View::Columns, "As Columns").shortcut_text(shortcut(ui, "Ctrl+3")))
+            .clicked()
+        {
+            a.push(Action::SetView(View::Columns));
+        }
         ui.separator();
         let mut hidden = self.config.show_hidden;
         if ui.checkbox(&mut hidden, "Show Hidden Files").clicked() {
@@ -1493,6 +1611,9 @@ impl Files {
         self.config.save();
         for tab in &mut self.tabs {
             listing::sort(&mut tab.entries, sort);
+        }
+        for entries in self.column_lists.values_mut().filter_map(|l| l.as_mut().ok()) {
+            listing::sort(entries, sort);
         }
     }
 
@@ -1650,6 +1771,9 @@ impl Files {
                 }
                 ui.add_space(6.0);
                 let view = self.config.view;
+                if glyph_toggle(ui, Glyph::Columns, view == View::Columns, "As columns (Ctrl+3)").clicked() {
+                    a.push(Action::SetView(View::Columns));
+                }
                 if glyph_toggle(ui, Glyph::List, view == View::List, "As list (Ctrl+2)").clicked() {
                     a.push(Action::SetView(View::List));
                 }
@@ -1938,7 +2062,8 @@ impl Files {
         let area = ui.available_rect_before_wrap();
         let background = ui.interact(area, ui.id().with("background"), Sense::click_and_drag());
 
-        if visible.is_empty() && (tab.loaded || tab.remote()) {
+        let in_columns = self.in_columns();
+        if visible.is_empty() && (tab.loaded || tab.remote()) && !in_columns {
             let empty = if !tab.loaded && tab.location == Location::Network(network::ROOT.into()) {
                 "Looking for servers…"
             } else if !tab.loaded {
@@ -1965,7 +2090,8 @@ impl Files {
 
         match self.config.view {
             View::Icons => self.icon_view(ui, &visible),
-            View::List => self.list_view(ui, &visible),
+            View::Columns if in_columns => self.column_view(ui, &visible),
+            View::List | View::Columns => self.list_view(ui, &visible),
         }
 
         self.background(ui, &background, &visible);
@@ -2082,7 +2208,8 @@ impl Files {
                 let (row, col) = (n / columns, n % columns);
                 Rect::from_min_size(pos2(col as f32 * cell.x, row as f32 * cell.y), cell).shrink(6.0)
             }
-            View::List => Rect::from_min_size(pos2(0.0, n as f32 * ROW), vec2(width, ROW)),
+            View::Columns if self.in_columns() => Rect::from_min_size(pos2(0.0, n as f32 * ROW), vec2(COLUMN, ROW)),
+            View::List | View::Columns => Rect::from_min_size(pos2(0.0, n as f32 * ROW), vec2(width, ROW)),
         }
     }
 
@@ -2168,7 +2295,7 @@ impl Files {
             let painter = if selected { ui.painter().clone() } else { painter };
             painter.galley(at, galley, colour);
         }
-        self.item_input(ui, &resp, &entry, selected);
+        self.item_input(ui, &resp, &entry, selected, None);
     }
 
     fn list_view(&mut self, ui: &mut Ui, visible: &[usize]) {
@@ -2310,13 +2437,219 @@ impl Files {
             ui.painter_at(cell).text(at, align, text, font.clone(), weak);
             x += w;
         }
-        self.item_input(ui, &resp, &entry, selected);
+        self.item_input(ui, &resp, &entry, selected, None);
     }
 
-    /// Clicks, drags, drops and the menu on one item.
-    fn item_input(&mut self, ui: &Ui, resp: &Response, entry: &Entry, selected: bool) {
+    /// The folder in columns, as a Mac's Finder shows it: a column for each
+    /// folder from where the path starts down to this one, each with the way
+    /// down marked; this folder's column, the one with the keys; and right of
+    /// it, the selected folder's items or the selected file's preview.
+    fn column_view(&mut self, ui: &mut Ui, visible: &[usize]) {
+        let Some(here) = self.current().folder().map(Path::to_path_buf) else { return };
+        let chain = self.column_chain();
+        let one = match self.current().selection()[..] {
+            [entry] => Some(entry.clone()),
+            _ => None,
+        };
+        let child = one.as_ref().filter(|e| e.is_folder()).map(|e| e.path.clone());
+        let preview = one.filter(|e| !e.is_folder());
+        let mut shown: Vec<PathBuf> = chain.iter().cloned().chain([here.clone()]).chain(child.clone()).collect();
+        let moved = shown != self.shown_columns;
+        let width = shown.len() as f32 * COLUMN + if preview.is_some() { PREVIEW } else { 0.0 };
+        let px = (ROW_ICON * ui.ctx().pixels_per_point()).round() as u32;
+        egui::ScrollArea::horizontal().auto_shrink(false).stick_to_right(true).id_salt(("columns", self.tab)).show(
+            ui,
+            |ui| {
+                let (strip, _) = ui.allocate_exact_size(vec2(width, ui.available_height()), Sense::hover());
+                let column = |n: usize| {
+                    Rect::from_min_size(strip.min + vec2(n as f32 * COLUMN, 0.0), vec2(COLUMN, strip.height()))
+                };
+                for (n, folder) in chain.iter().enumerate() {
+                    let next = chain.get(n + 1).unwrap_or(&here);
+                    self.side_column(ui, column(n), folder, Some(next), px);
+                }
+                self.active_column(ui, column(chain.len()), &here, visible, px);
+                let mut last = column(chain.len());
+                if let Some(child) = &child {
+                    last = column(chain.len() + 1);
+                    self.side_column(ui, last, child, None, px);
+                }
+                if let Some(entry) = &preview {
+                    last = Rect::from_min_size(
+                        strip.min + vec2(shown.len() as f32 * COLUMN, 0.0),
+                        vec2(PREVIEW, strip.height()),
+                    );
+                    self.preview_column(ui, last, entry);
+                }
+                if moved {
+                    ui.scroll_to_rect(last, None);
+                }
+            },
+        );
+        self.shown_columns = std::mem::take(&mut shown);
+    }
+
+    /// The tab's own folder as a column: its items are the selection, the
+    /// keys move in it, and the band selects in it.
+    fn active_column(&mut self, ui: &mut Ui, rect: Rect, folder: &Path, visible: &[usize], px: u32) {
+        column_edge(ui, rect);
+        let mut area = egui::ScrollArea::vertical().auto_shrink(false).id_salt(("column", folder));
+        if let Some(n) = self.scroll_target(visible) {
+            area = area.vertical_scroll_offset(self.reveal(n as f32 * ROW, ROW));
+        }
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            let output = area.show_rows(ui, ROW, visible.len(), |ui, range| {
+                self.origin = pos2(ui.max_rect().left(), ui.min_rect().top() - range.start as f32 * ROW);
+                for n in range {
+                    let (row, _) = ui.allocate_exact_size(vec2(COLUMN, ROW), Sense::hover());
+                    let entry = self.current().entries[visible[n]].clone();
+                    let selected = self.current().selected.contains(&entry.path);
+                    let mark = if selected { Mark::Selected } else { Mark::None };
+                    self.column_row(ui, row, &entry, mark, None, px);
+                }
+            });
+            self.viewport = (output.state.offset.y, output.inner_rect.height());
+        });
+    }
+
+    /// Another folder's column: one to the left with `next`, the folder on
+    /// the way down, marked; or the selected folder's, with nothing marked.
+    /// Clicking in it makes its folder the tab's.
+    fn side_column(&mut self, ui: &mut Ui, rect: Rect, folder: &Path, next: Option<&Path>, px: u32) {
+        column_edge(ui, rect);
+        let background = ui.interact(rect, Id::new(("column-background", folder)), Sense::click_and_drag());
+        if background.clicked() || background.secondary_clicked() {
+            self.actions.push(Action::Column { folder: folder.to_path_buf(), select: None });
+        }
+        let mut a = Vec::new();
+        drop_target(ui, &background, &Location::Folder(folder.to_path_buf()), &mut a);
+        self.actions.extend(a);
+
+        let visible = match self.column_lists.get(folder) {
+            Some(Ok(entries)) => shown(entries, self.config.show_hidden, "", self.current().types.as_ref()),
+            Some(Err(e)) => {
+                let text = egui::RichText::new(format!("Can't show this folder: {e}")).weak().small();
+                ui.put(rect.shrink(12.0), egui::Label::new(text).wrap());
+                return;
+            }
+            None => return,
+        };
+        let mut area = egui::ScrollArea::vertical().auto_shrink(false).id_salt(("column", folder));
+        // A column that's new shows the way down in its middle.
+        if !self.shown_columns.iter().any(|f| f == folder)
+            && let Some(n) = self
+                .column_entries(folder)
+                .and_then(|entries| visible.iter().position(|&i| next.is_some_and(|next| entries[i].path == next)))
+        {
+            area = area.vertical_scroll_offset((n as f32 * ROW - rect.height() / 2.0).max(0.0));
+        }
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            area.show_rows(ui, ROW, visible.len(), |ui, range| {
+                for n in range {
+                    let (row, _) = ui.allocate_exact_size(vec2(COLUMN, ROW), Sense::hover());
+                    let Some(entry) = self.column_entries(folder).map(|e| e[visible[n]].clone()) else { return };
+                    let mark = if next == Some(entry.path.as_path()) { Mark::OnTheWay } else { Mark::None };
+                    self.column_row(ui, row, &entry, mark, Some(folder), px);
+                }
+            });
+        });
+    }
+
+    fn column_entries(&self, folder: &Path) -> Option<&[Entry]> {
+        self.column_lists.get(folder)?.as_deref().ok()
+    }
+
+    /// An item in a column: its icon and name, and an arrow if it's a folder
+    /// to go into.
+    fn column_row(&mut self, ui: &mut Ui, rect: Rect, entry: &Entry, mark: Mark, elsewhere: Option<&Path>, px: u32) {
+        let resp = ui.interact(rect, Id::new(("item", &entry.path)), Sense::click_and_drag());
+        let v = ui.visuals().clone();
+        let painter = ui.painter_at(rect);
+        let fill = rect.shrink2(vec2(4.0, 0.0));
+        let dropping =
+            entry.is_folder() && resp.dnd_hover_payload::<Dragged>().is_some_and(|d| !d.0.contains(&entry.path));
+        let back = match mark {
+            Mark::Selected => Some(v.selection.bg_fill),
+            Mark::OnTheWay => Some(v.selection.bg_fill.gamma_multiply(0.35)),
+            Mark::None if dropping || resp.hovered() => Some(v.widgets.hovered.weak_bg_fill),
+            Mark::None => None,
+        };
+        if let Some(back) = back {
+            painter.rect_filled(fill, CornerRadius::same(4), back);
+        }
+        let selected = mark == Mark::Selected;
+        let colour = if selected { v.selection.stroke.color } else { v.text_color() };
+
+        let icon =
+            Rect::from_center_size(pos2(fill.left() + 6.0 + ROW_ICON / 2.0, rect.center().y), vec2(ROW_ICON, ROW_ICON));
+        if let Some(texture) = self.icons.get(&self.icon_source(entry), px) {
+            let dim = self.clip.as_ref().is_some_and(|c| c.cut && c.paths.contains(&entry.path));
+            let tint = if dim { egui::Color32::WHITE.gamma_multiply(0.45) } else { egui::Color32::WHITE };
+            painter.image(texture, icon, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint);
+        }
+        if entry.symlink {
+            link_badge(&painter, icon, &v);
+        }
+        let arrow = Rect::from_min_max(pos2(fill.right() - 16.0, rect.top()), fill.right_bottom());
+        if entry.is_folder() {
+            glyphs::paint(&painter, arrow, Glyph::Separator, Stroke::new(1.0, colour.gamma_multiply(0.7)));
+        }
+        let text_left = icon.right() + 6.0;
+        if elsewhere.is_none() && self.renaming.as_ref().is_some_and(|r| r.path == entry.path) {
+            let field =
+                Rect::from_min_max(pos2(text_left - 4.0, rect.top() + 1.0), pos2(arrow.left(), rect.bottom() - 1.0));
+            self.rename_field(ui, field, false);
+        } else {
+            let mut job = LayoutJob::single_section(
+                entry.name.clone(),
+                TextFormat { font_id: egui::TextStyle::Body.resolve(ui.style()), color: colour, ..Default::default() },
+            );
+            job.wrap.max_width = arrow.left() - text_left;
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            let galley = ui.painter().layout_job(job);
+            painter.galley(pos2(text_left, rect.center().y - galley.size().y / 2.0), galley, colour);
+        }
+        self.item_input(ui, &resp, entry, selected, elsewhere);
+    }
+
+    /// The selected file at the columns' end: large, with what it is.
+    fn preview_column(&mut self, ui: &mut Ui, rect: Rect, entry: &Entry) {
+        let px = (PREVIEW_ICON * ui.ctx().pixels_per_point()).round() as u32;
+        let icon = self.icons.get(&self.icon_source(entry), px);
+        let mut details = vec![entry.describe.clone()];
+        if entry.kind == Kind::File && entry.remote.is_none() {
+            details.push(listing::human_size(entry.size));
+        }
+        if let Some(modified) = entry.modified {
+            details.push(format!("Modified {}", when(modified)));
+        }
+        let inner = rect.shrink2(vec2(16.0, 24.0));
+        ui.scope_builder(UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(Align::Center)), |ui| {
+            let (at, _) = ui.allocate_exact_size(vec2(PREVIEW_ICON, PREVIEW_ICON), Sense::hover());
+            if let Some(icon) = icon {
+                ui.painter().image(icon, at, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), egui::Color32::WHITE);
+            }
+            ui.add_space(12.0);
+            ui.add(egui::Label::new(egui::RichText::new(&entry.name).strong()).wrap());
+            ui.add_space(4.0);
+            for line in details {
+                ui.label(egui::RichText::new(line).weak().small());
+            }
+        });
+    }
+
+    /// Clicks, drags, drops and the menu on one item; `elsewhere` is the
+    /// folder of another column it's in, which a click makes the tab's.
+    fn item_input(&mut self, ui: &Ui, resp: &Response, entry: &Entry, selected: bool, elsewhere: Option<&Path>) {
         let m = ui.input(|i| i.modifiers);
-        if resp.clicked() {
+        if let Some(folder) = elsewhere
+            && (resp.clicked() || resp.secondary_clicked())
+        {
+            self.actions.push(Action::Column { folder: folder.to_path_buf(), select: Some(entry.path.clone()) });
+        } else if resp.clicked() {
             self.actions.push(Action::Click { path: entry.path.clone(), add: m.command, range: m.shift });
         }
         if resp.double_clicked() {
@@ -2325,7 +2658,7 @@ impl Files {
         if resp.clicked_by(egui::PointerButton::Middle) && entry.is_folder() {
             self.actions.push(Action::OpenInNewTab(Location::Folder(entry.path.clone())));
         }
-        if resp.secondary_clicked() && !selected {
+        if resp.secondary_clicked() && !selected && elsewhere.is_none() {
             self.actions.push(Action::SelectOnly(vec![entry.path.clone()]));
         }
         let tab = self.current();
@@ -2336,6 +2669,8 @@ impl Files {
         if resp.drag_started() && !in_trash && !remote {
             let paths = if selected {
                 selection
+            } else if elsewhere.is_some() {
+                vec![entry.path.clone()]
             } else {
                 self.actions.push(Action::SelectOnly(vec![entry.path.clone()]));
                 vec![entry.path.clone()]
@@ -3239,6 +3574,33 @@ fn list_columns(width: f32) -> Vec<(SortBy, &'static str, f32, bool)> {
     let mut columns = vec![(SortBy::Name, "Name", (width - used).max(120.0), false)];
     columns.extend(rest);
     columns
+}
+
+/// The entries shown: hidden ones only when asked, only files of `types`,
+/// and only those `filter` matches, as indices into `entries`.
+fn shown(entries: &[Entry], show_hidden: bool, filter: &str, types: Option<&Filter>) -> Vec<usize> {
+    let filter = filter.trim().to_lowercase();
+    (0..entries.len())
+        .filter(|&i| {
+            let e = &entries[i];
+            let typed = e.kind != Kind::File || types.is_none_or(|t| t.matches(&e.name, e.mime.as_deref()));
+            typed && (show_hidden || !e.hidden) && (filter.is_empty() || e.name.to_lowercase().contains(&filter))
+        })
+        .collect()
+}
+
+/// How an item in a column is marked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    None,
+    Selected,
+    /// The folder the next column shows.
+    OnTheWay,
+}
+
+/// The line between a column and the next.
+fn column_edge(ui: &Ui, rect: Rect) {
+    ui.painter().vline(rect.right(), rect.y_range(), ui.visuals().widgets.noninteractive.bg_stroke);
 }
 
 /// The path as places to go: from Home when it's inside it, from the

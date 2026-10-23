@@ -25,7 +25,8 @@ lost). `pgrep -f` matches your own shell: find processes with `pgrep -x files`.
 
 ## Layout
 
-- `src/app.rs`: the window: menus and tabs, toolbar and path bar, sidebar, icon and list views,
+- `src/app.rs`: the window: menus and tabs, toolbar and path bar, sidebar, icon, list and column
+  views (the tab's folder is the column with the keys; the others are `column_lists`),
   keys, drag and drop, the selection band, rename field, dialogs. Widgets push `Action`s; `apply`
   does them after the frame.
 - `src/listing.rs`: reading a folder or the Trash on a thread, `Entry`, sorting.

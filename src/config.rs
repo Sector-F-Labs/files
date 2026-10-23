@@ -11,6 +11,8 @@ use crate::listing::Sort;
 pub enum View {
     Icons,
     List,
+    /// A column for each folder down to this one, as a Mac's Finder has.
+    Columns,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
