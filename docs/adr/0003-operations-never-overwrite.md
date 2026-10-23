@@ -4,7 +4,7 @@ Date: 2026-10-16
 
 ## Status
 
-Accepted
+Accepted; its rule for taken names superseded by [ADR-0009](0009-taken-names-are-asked-about.md)
 
 ## Context
 

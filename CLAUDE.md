@@ -30,7 +30,8 @@ lost). `pgrep -f` matches your own shell: find processes with `pgrep -x files`.
   does them after the frame.
 - `src/listing.rs`: reading a folder or the Trash on a thread, `Entry`, sorting.
 - `src/ops.rs`: copy, move, trash, restore and purge on one worker thread with progress and
-  Stop; free names ("name copy"), new folder, rename.
+  Stop; a taken name waits on the window's answer (merge, replace, keep both, skip; ADR-0009);
+  free names ("name copy"), new folder, rename.
 - `src/icons.rs`: theme icons, app icons and thumbnails on a thread, newest request first.
 - `src/preview.rs`: Quick Look's pictures (ADR-0008), decoded at screen size on a thread, newest
   only, EXIF-turned (`open`, which thumbnails use too). Its window is an immediate viewport,
@@ -50,5 +51,5 @@ lost). `pgrep -f` matches your own shell: find processes with `pgrep -x files`.
 ## Rules
 
 - Paint colours only from `ui.visuals()`, so skins reach them.
-- Never overwrite a file: operations take a free name.
+- Never overwrite a file: operations take a free name, or put what they replace in the Trash.
 - Anything that reads the disk runs off the UI thread.

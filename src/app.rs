@@ -26,7 +26,7 @@ use crate::icons::{self, Icons, Source};
 use crate::listing::{self, Entry, Kind, Listed, Location, SortBy};
 use crate::mime::Mime;
 use crate::network::{self, Network};
-use crate::ops::{self, Op};
+use crate::ops::{self, Choice, Op};
 use crate::places::{self, Place};
 use crate::preview::{self, Previews};
 use crate::uri;
@@ -312,6 +312,8 @@ pub struct Files {
     connecting: Option<(String, String)>,
     focus_filter: bool,
     confirm: Option<Confirm>,
+    /// The conflict dialog's "for all" box (ADR-0009).
+    for_all: bool,
     /// The latest message for the status bar, until the next replaces it.
     message: Option<Message>,
     typed: (String, Instant),
@@ -426,6 +428,7 @@ impl Files {
             connecting: None,
             focus_filter: false,
             confirm: None,
+            for_all: false,
             message: None,
             typed: (String::new(), Instant::now()),
             columns: 1,
@@ -1164,7 +1167,12 @@ impl Files {
     /// The shortcuts, taken before the widgets see them; none while a text
     /// field has the keys.
     fn keys(&mut self, ctx: &egui::Context) {
-        if ctx.text_edit_focused() || self.renaming.is_some() || self.confirm.is_some() || !self.asking.is_empty() {
+        if ctx.text_edit_focused()
+            || self.renaming.is_some()
+            || self.confirm.is_some()
+            || !self.asking.is_empty()
+            || self.worker.status.lock().unwrap_or_else(|e| e.into_inner()).conflict.is_some()
+        {
             return;
         }
         let mut actions = Vec::new();
@@ -2515,6 +2523,7 @@ impl Files {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.ask_dialog(ctx);
+        self.conflict_dialog(ctx);
         let Some(confirm) = &self.confirm else { return };
         let (title, detail) = match confirm {
             Confirm::Purge(items) if items.len() == 1 => {
@@ -2560,6 +2569,78 @@ impl Files {
             }
             Some(false) => self.confirm = None,
             None => {}
+        }
+    }
+
+    /// A name taken where a copy or move is going, asked about as Nautilus
+    /// does (ADR-0009): two folders merge, anything else is replaced, and
+    /// either can keep both or be skipped.
+    fn conflict_dialog(&mut self, ctx: &egui::Context) {
+        let conflict = self.worker.status.lock().unwrap_or_else(|e| e.into_inner()).conflict.clone();
+        let Some(conflict) = conflict else { return };
+        let name = places::name(&conflict.existing);
+        let into = conflict.existing.parent().map(places::name).unwrap_or_default();
+        let (title, detail, yes, choice, all) = if conflict.folders {
+            (
+                format!("Merge folder “{name}”?"),
+                format!(
+                    "A folder with that name is already in “{into}”. Merging asks before replacing any files in it."
+                ),
+                "Merge",
+                Choice::Merge,
+                "Do this for all folders",
+            )
+        } else {
+            (
+                format!("Replace “{name}”?"),
+                format!("An item with that name is already in “{into}”. Replacing puts it in the Trash."),
+                "Replace",
+                Choice::Replace,
+                "Do this for all files",
+            )
+        };
+        let mut answer = None;
+        let modal = egui::Modal::new(Id::new(("conflict", &conflict.source))).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading(title);
+            ui.label(detail);
+            ui.add_space(8.0);
+            egui::Grid::new("conflict sides").num_columns(2).show(ui, |ui| {
+                // The conflict's sides are the newcomer's, then what's there.
+                for (side, i) in [("Already there", 1), ("Coming in", 0)] {
+                    let about: Vec<String> =
+                        [conflict.sizes[i].map(listing::human_size), conflict.modified[i].map(when)]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                    ui.label(egui::RichText::new(side).weak());
+                    ui.label(about.join(", "));
+                    ui.end_row();
+                }
+            });
+            ui.add_space(8.0);
+            ui.checkbox(&mut self.for_all, all);
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui.button(yes).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                    answer = Some(choice);
+                }
+                if ui.button("Keep Both").clicked() {
+                    answer = Some(Choice::KeepBoth);
+                }
+                if ui.button("Skip").clicked() {
+                    answer = Some(Choice::Skip);
+                }
+                if ui.button("Cancel").clicked() {
+                    answer = Some(Choice::Cancel);
+                }
+            });
+        });
+        if modal.should_close() {
+            answer = answer.or(Some(Choice::Cancel));
+        }
+        if let Some(choice) = answer {
+            self.worker.answer(choice, std::mem::take(&mut self.for_all));
         }
     }
 
