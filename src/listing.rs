@@ -93,7 +93,7 @@ fn read_dir(dir: &Path, mime: &Mime) -> std::io::Result<Vec<Entry>> {
     Ok(entries)
 }
 
-fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime) -> Entry {
+pub fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime) -> Entry {
     let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let hidden = file_name.starts_with('.');
     let modified = meta.modified().ok();

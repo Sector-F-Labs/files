@@ -36,6 +36,9 @@ lost). `pgrep -f` matches your own shell: find processes with `pgrep -x files`.
 - `src/preview.rs`: Quick Look's pictures (ADR-0008), decoded at screen size on a thread, newest
   only, EXIF-turned (`open`, which thumbnails use too). Its window is an immediate viewport,
   `Files::quick_look`, which runs `keys` on its own input.
+- `src/properties.rs`: the Properties window's facts (stat, owner and group, free space, folder
+  contents counted until the window closes) and permission changes, on threads; drawn by
+  `Files::properties_window`.
 - `src/mime.rs`: types from shared-mime-info's `globs2`, icon names, descriptions.
 - `src/portal.rs`: `files --portal`, the `org.freedesktop.impl.portal.FileChooser` service;
   each request runs `files --choose` (a process per dialog: one winit loop per process).

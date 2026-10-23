@@ -29,6 +29,7 @@ use crate::network::{self, Network};
 use crate::ops::{self, Choice, Op};
 use crate::places::{self, Place};
 use crate::preview::{self, Previews};
+use crate::properties::{self, Properties};
 use crate::uri;
 use crate::watch::Watcher;
 
@@ -49,6 +50,8 @@ const QUICK_LOOK_ID: &str = "com.sectorflabs.Files.QuickLook";
 const QUICK_LOOK_SIZE: [f32; 2] = [720.0, 540.0];
 /// Its icon, for what isn't a picture.
 const QUICK_LOOK_ICON: f32 = 128.0;
+/// The Properties window's icon.
+const PROPERTIES_ICON: f32 = 64.0;
 /// How long typed letters keep adding to the name they find.
 const TYPE_AHEAD: Duration = Duration::from_millis(1000);
 
@@ -260,6 +263,9 @@ enum Action {
     FocusFilter,
     /// Space: shows the selected item large in a window of its own, or closes it.
     QuickLook,
+    /// Shows the Properties of what's selected, or of the folder.
+    Properties,
+    CloseProperties,
 }
 
 pub struct Files {
@@ -284,6 +290,8 @@ pub struct Files {
     previews: Previews,
     /// Quick Look is showing the item at the cursor (ADR-0008).
     looking: bool,
+    /// The Properties window, while it's open.
+    properties: Option<Properties>,
     places: Vec<Place>,
     disks: Vec<Place>,
     /// Folders with their own icon: home, Apps, Documents and the rest.
@@ -408,6 +416,7 @@ impl Files {
             icons: Icons::new(ctx),
             previews: Previews::new(ctx),
             looking: false,
+            properties: None,
             places,
             disks: places::disks(),
             special,
@@ -847,6 +856,17 @@ impl Files {
                 });
             }
             Action::FocusFilter => self.focus_filter = true,
+            Action::Properties => {
+                let tab = self.current();
+                let mut paths: Vec<PathBuf> = tab.selection().iter().map(|e| e.path.clone()).collect();
+                if paths.is_empty() {
+                    paths.extend(tab.folder().map(Path::to_path_buf));
+                }
+                if tab.folder().is_some() && !paths.is_empty() {
+                    self.properties = Some(Properties::new(paths, self.mime.clone(), ctx));
+                }
+            }
+            Action::CloseProperties => self.properties = None,
         }
     }
 
@@ -1182,6 +1202,7 @@ impl Files {
         let in_trash = self.current().in_trash();
         let picking = self.picking.is_some();
         let looking = self.looking;
+        let properties = self.properties.is_some();
         // A space goes on with a name being typed, else it's Quick Look;
         // then the text the key also makes isn't typed.
         let typing = !self.typed.0.is_empty() && self.typed.1.elapsed() < TYPE_AHEAD;
@@ -1208,7 +1229,10 @@ impl Files {
                                 Action::QuickLook
                             }
                             Key::Escape if looking => Action::QuickLook,
+                            Key::Escape if properties => Action::CloseProperties,
                             Key::Enter if plain && picking => Action::Accept,
+                            Key::Enter if m.alt && !m.command && !picking => Action::Properties,
+                            Key::I if m.command && !picking => Action::Properties,
                             Key::Escape if picking => Action::Cancel,
                             Key::N | Key::T | Key::W | Key::Q if picking && m.command && !m.shift => return true,
                             Key::Enter if plain => match self.tabs[self.tab].selection().first() {
@@ -1355,6 +1379,11 @@ impl Files {
             && ui.button("Open Terminal Here").clicked()
         {
             a.push(Action::Terminal(folder.clone()));
+        }
+        ui.separator();
+        let properties = egui::Button::new("Properties").shortcut_text(shortcut(ui, "Ctrl+I"));
+        if ui.add_enabled(folder.is_some(), properties).clicked() {
+            a.push(Action::Properties);
         }
         ui.separator();
         if ui.add(egui::Button::new("Close Tab").shortcut_text(shortcut(ui, "Ctrl+W"))).clicked() {
@@ -1987,6 +2016,12 @@ impl Files {
             if ui.checkbox(&mut hidden, "Show Hidden Files").clicked() {
                 a.push(Action::ToggleHidden);
             }
+            if folder.is_some() {
+                ui.separator();
+                if ui.button("Properties").clicked() {
+                    a.push(Action::Properties);
+                }
+            }
         });
         self.actions.extend(a);
 
@@ -2370,6 +2405,10 @@ impl Files {
             if ui.button("Move to Trash").clicked() {
                 a.push(Action::Trash);
             }
+            ui.separator();
+            if ui.button("Properties").clicked() {
+                a.push(Action::Properties);
+            }
         });
         self.actions.extend(a);
     }
@@ -2641,6 +2680,159 @@ impl Files {
         }
         if let Some(choice) = answer {
             self.worker.answer(choice, std::mem::take(&mut self.for_all));
+        }
+    }
+
+    // ---- Properties ----
+
+    /// Properties (Ctrl+I): what's selected, or the folder, as Nautilus
+    /// shows them: type, size and where it is, its times, and who may read,
+    /// change or run it, which its owner can change here.
+    fn properties_window(&mut self, ctx: &egui::Context) {
+        let Some(properties) = &self.properties else { return };
+        let info = properties.info().clone();
+        let px = (PROPERTIES_ICON * ctx.pixels_per_point()).round() as u32;
+        let one = match &info.items[..] {
+            [item] => Some(item),
+            _ => None,
+        };
+        let icon = one.and_then(|item| self.icons.get(&self.icon_source(&item.entry), px));
+        let title = one.map_or_else(|| "Properties".to_string(), |item| format!("{} Properties", item.entry.name));
+        let mut open = true;
+        let mut mode = None;
+        egui::Window::new(title)
+            .id(Id::new("properties"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                if !info.read {
+                    ui.spinner();
+                    return;
+                }
+                for error in &info.errors {
+                    ui.label(egui::RichText::new(error).color(ui.visuals().error_fg_color));
+                }
+                if info.items.is_empty() {
+                    return;
+                }
+                let name = one.map_or_else(|| format!("{} items", info.items.len()), |item| item.entry.name.clone());
+                ui.horizontal(|ui| {
+                    if let Some(icon) = icon {
+                        ui.image((icon, vec2(PROPERTIES_ICON, PROPERTIES_ICON)));
+                    }
+                    ui.add(egui::Label::new(egui::RichText::new(name).heading()).wrap());
+                });
+                ui.add_space(8.0);
+
+                let weak = |ui: &mut Ui, text: &str| {
+                    ui.label(egui::RichText::new(text).weak());
+                };
+                egui::Grid::new("properties details").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
+                    let first = &info.items[0];
+                    let kinds: HashSet<&str> = info.items.iter().map(|i| i.entry.describe.as_str()).collect();
+                    let kind = match (kinds.len(), &first.entry.mime) {
+                        (1, Some(mime)) if one.is_some() => format!("{} ({mime})", first.entry.describe),
+                        (1, _) => first.entry.describe.clone(),
+                        _ => "Mixed".into(),
+                    };
+                    weak(ui, "Type");
+                    ui.label(kind);
+                    ui.end_row();
+
+                    weak(ui, if one.is_some_and(properties::Item::is_folder) { "Contents" } else { "Size" });
+                    ui.horizontal(|ui| {
+                        ui.label(info.size());
+                        if info.counting && one.is_none_or(properties::Item::is_folder) {
+                            ui.spinner();
+                        }
+                    });
+                    ui.end_row();
+                    if info.unreadable > 0 {
+                        ui.label("");
+                        let folders = if info.unreadable == 1 { "folder" } else { "folders" };
+                        ui.label(
+                            egui::RichText::new(format!("{} {folders} inside couldn't be read", info.unreadable))
+                                .color(ui.visuals().warn_fg_color),
+                        );
+                        ui.end_row();
+                    }
+
+                    let parents: HashSet<Option<&Path>> = info.items.iter().map(|i| i.entry.path.parent()).collect();
+                    if let [Some(parent)] = parents.into_iter().collect::<Vec<_>>()[..] {
+                        weak(ui, "Location");
+                        ui.add(egui::Label::new(parent.display().to_string()).selectable(true));
+                        ui.end_row();
+                    }
+                    let Some(item) = one else { return };
+                    if let Some(target) = &item.target {
+                        weak(ui, "Link to");
+                        ui.add(egui::Label::new(target.display().to_string()).selectable(true));
+                        ui.end_row();
+                    }
+                    if let Some((free, total)) = item.disk {
+                        weak(ui, "Free space");
+                        ui.label(format!("{} of {}", listing::human_size(free), listing::human_size(total)));
+                        ui.end_row();
+                    }
+                    for (label, time) in
+                        [("Modified", item.entry.modified), ("Accessed", item.accessed), ("Created", item.created)]
+                    {
+                        if let Some(time) = time {
+                            weak(ui, label);
+                            ui.label(date_time(time));
+                            ui.end_row();
+                        }
+                    }
+                });
+
+                let Some(item) = one else { return };
+                if item.entry.remote.is_some() {
+                    return;
+                }
+                ui.add_space(4.0);
+                ui.separator();
+                let folder = item.is_folder();
+                let mine = properties::may_change(item);
+                ui.add_enabled_ui(mine, |ui| {
+                    egui::Grid::new("properties permissions").num_columns(3).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
+                        for (who, name, shift) in
+                            [("Owner", item.owner.as_str(), 6), ("Group", item.group.as_str(), 3), ("Others", "", 0)]
+                        {
+                            weak(ui, who);
+                            ui.label(name);
+                            let (bits, shown) = properties::access(item.mode, shift, folder);
+                            egui::ComboBox::from_id_salt(("access", shift)).selected_text(shown).width(180.0).show_ui(
+                                ui,
+                                |ui| {
+                                    for &(level, value) in properties::levels(folder).0 {
+                                        if ui.selectable_label(bits == value, level).clicked() {
+                                            mode = Some(properties::with_access(item.mode, shift, folder, value));
+                                        }
+                                    }
+                                },
+                            );
+                            ui.end_row();
+                        }
+                    });
+                    if !folder {
+                        let mut executable = item.mode & 0o111 != 0;
+                        if ui.checkbox(&mut executable, "Allow executing file as program").changed() {
+                            mode = Some(properties::with_executable(item.mode, executable));
+                        }
+                    }
+                });
+                if !mine {
+                    weak(ui, "Only its owner can change who may use it.");
+                }
+            });
+        if !open {
+            self.properties = None;
+        } else if let (Some(mode), Some(properties)) = (mode, &self.properties) {
+            properties.set_mode(mode);
         }
     }
 
@@ -2962,6 +3154,7 @@ impl eframe::App for Files {
             .show(ui, |ui| self.items(ui));
 
         self.quick_look(&ctx);
+        self.properties_window(&ctx);
         self.drag_out(&ctx);
         self.drag_ghost(&ctx);
         self.dialogs(&ctx);
@@ -3122,6 +3315,15 @@ fn when(time: std::time::SystemTime) -> String {
     } else {
         format!("{d} {} {y}", MONTHS[m as usize - 1])
     }
+}
+
+/// The date and time in full, as Properties shows them: "24 Oct 2026 14:03".
+fn date_time(time: std::time::SystemTime) -> String {
+    let secs = time.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) + local_offset();
+    let (day, then) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let (y, m, d) = civil(day);
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    format!("{d} {} {y} {:02}:{:02}", MONTHS[m as usize - 1], then / 3600, then % 3600 / 60)
 }
 
 /// Days since 1970 as a year, month and day (Howard Hinnant's algorithm).
