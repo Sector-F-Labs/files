@@ -1918,7 +1918,7 @@ impl Files {
                 if resp.clicked_by(egui::PointerButton::Middle) {
                     a.push(Action::OpenInNewTab(location.clone()));
                 }
-                resp.context_menu(|ui| {
+                patina::menu::context(&resp, |ui| {
                     if ui.button("Open in New Tab").clicked() {
                         a.push(Action::OpenInNewTab(location.clone()));
                     }
@@ -2113,7 +2113,7 @@ impl Files {
         let mut hidden = self.config.show_hidden;
         let mut a = Vec::new();
         let remote = self.current().remote();
-        background.context_menu(|ui| {
+        patina::menu::context(background, |ui| {
             if remote {
                 if ui.button("Connect to Server…").clicked() {
                     a.push(Action::ConnectToServer);
@@ -2685,7 +2685,7 @@ impl Files {
         }
 
         let mut a = Vec::new();
-        resp.context_menu(|ui| {
+        patina::menu::context(resp, |ui| {
             if let Some(item) = &entry.remote {
                 if ui.button("Open").clicked() {
                     a.push(Action::Open(entry.path.clone()));
