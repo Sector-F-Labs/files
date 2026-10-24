@@ -7,6 +7,7 @@ mod app;
 mod chooser;
 mod config;
 mod dnd;
+mod editor;
 mod glyphs;
 mod icons;
 mod listing;

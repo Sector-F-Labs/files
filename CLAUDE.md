@@ -41,6 +41,7 @@ lost). `pgrep -f` matches your own shell: find processes with `pgrep -x files`.
   contents counted until the window closes) and permission changes, on threads; drawn by
   `Files::properties_window`.
 - `src/mime.rs`: types from shared-mime-info's `globs2`, icon names, descriptions.
+- `src/editor.rs`: the text editor for a script's Edit (ADR-0011), from the mimeapps lists.
 - `src/portal.rs`: `files --portal`, the `org.freedesktop.impl.portal.FileChooser` service;
   each request runs `files --choose` (a process per dialog: one winit loop per process).
   `src/chooser.rs`: the request and answer (TOML over stdin/stdout), filters and globs.

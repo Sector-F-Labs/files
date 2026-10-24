@@ -45,6 +45,8 @@ pub struct Entry {
     pub describe: String,
     /// Executable, so it gets the executable's icon when it has no type.
     pub executable: bool,
+    /// An executable script, starting `#!`: opening runs it (ADR-0011).
+    pub script: bool,
     /// In the trash: where it was, and the item to restore or purge.
     pub trashed: Option<trash::TrashItem>,
     /// A server or share on the network, whose path is its URI.
@@ -110,6 +112,7 @@ pub fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime
                 mime: None,
                 describe: "Application".into(),
                 executable: false,
+                script: false,
                 trashed: None,
                 remote: None,
             };
@@ -126,12 +129,14 @@ pub fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime
             mime: None,
             describe: "Folder".into(),
             executable: false,
+            script: false,
             trashed: None,
             remote: None,
         };
     }
     let ty = mime.guess(&file_name).map(str::to_string);
     let executable = mime::executable(meta);
+    let script = executable && is_script(&path);
     let describe = match &ty {
         Some(ty) => mime.describe(ty),
         None if executable => "Program".into(),
@@ -148,9 +153,17 @@ pub fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime
         mime: ty,
         describe,
         executable,
+        script,
         trashed: None,
         remote: None,
     }
+}
+
+/// Whether the file at `path` starts `#!`, as a script does.
+fn is_script(path: &Path) -> bool {
+    use std::io::Read;
+    let mut start = [0; 2];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut start)).is_ok() && &start == b"#!"
 }
 
 /// The trash, through the freedesktop trash spec: each item where it lies
@@ -176,6 +189,7 @@ fn read_trash(mime: &Mime) -> Result<Vec<Entry>, String> {
                     mime: None,
                     describe: "File".into(),
                     executable: false,
+                    script: false,
                     trashed: None,
                     remote: None,
                 },

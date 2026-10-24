@@ -52,3 +52,4 @@ mechanics of adding one.
 | [0008](0008-quick-look.md) | Quick Look: Space shows the selected item in a window of its own | Accepted |
 | [0009](0009-taken-names-are-asked-about.md) | A name that's taken is asked about, as Nautilus does: folders merge, a replaced item goes to the Trash | Accepted |
 | [0010](0010-the-column-view.md) | The column view: the tab's folder is the column with the keys, the others are read beside it | Accepted |
+| [0011](0011-scripts-run-and-edit.md) | An executable script runs when opened, and Edit opens it in the text editor | Accepted |

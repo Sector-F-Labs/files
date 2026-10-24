@@ -21,6 +21,7 @@ use patina::tabs::{self, TabAction, TabStrip};
 use crate::chooser::{Answer, Filter, Request};
 use crate::config::{Config, View};
 use crate::dnd::Over;
+use crate::editor;
 use crate::glyphs::{self, Glyph};
 use crate::icons::{self, Icons, Source};
 use crate::listing::{self, Entry, Kind, Listed, Location, SortBy};
@@ -244,6 +245,8 @@ enum Action {
     StartRename,
     NewFolder,
     Terminal(PathBuf),
+    /// A script opened in the text editor (ADR-0011).
+    Edit(PathBuf),
     NewWindow,
     Drop {
         paths: Vec<PathBuf>,
@@ -874,6 +877,16 @@ impl Files {
                     self.message = Some(Message::error(format!("Can't open a terminal: {e}")));
                 }
             }
+            Action::Edit(path) => {
+                let line = editor::command(&path);
+                let started = line.and_then(|line| {
+                    let dir = path.parent().unwrap_or(Path::new("/"));
+                    spawn_in(&line[0], &line[1..], dir).map_err(|e| format!("{}: {e}", line[0]))
+                });
+                if let Err(e) = started {
+                    self.message = Some(Message::error(format!("Can't edit {}: {e}", places::name(&path))));
+                }
+            }
             Action::NewWindow => {
                 let here = self.current().folder().map(Path::to_path_buf);
                 let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("files"));
@@ -1007,8 +1020,8 @@ impl Files {
         self.load(location, ctx);
     }
 
-    /// Opens what's at `path`: goes into a folder, runs an app, and hands a
-    /// file to the desktop's app for it.
+    /// Opens what's at `path`: goes into a folder, runs an app or a script,
+    /// and hands a file to the desktop's app for it.
     fn open(&mut self, path: &Path, ctx: &egui::Context) {
         let Some(entry) = self.current().entries.iter().find(|e| e.path == path).cloned() else {
             return;
@@ -1044,6 +1057,12 @@ impl Files {
                 Ok(()) => {}
                 Err(e) => self.message = Some(Message::error(format!("Can't open {}: {e}", entry.name))),
             },
+            Kind::File if entry.script => {
+                let dir = entry.path.parent().unwrap_or(Path::new("/"));
+                if let Err(e) = spawn_in(&entry.path.to_string_lossy(), &[], dir) {
+                    self.message = Some(Message::error(format!("Can't run {}: {e}", entry.name)));
+                }
+            }
             Kind::File => {
                 if let Err(e) = patina::open::path(&entry.path) {
                     self.message = Some(Message::error(format!("Can't open {}: {e}", entry.name)));
@@ -2704,8 +2723,11 @@ impl Files {
                 }
                 return;
             }
-            if ui.button("Open").clicked() {
+            if ui.button(if entry.script { "Run" } else { "Open" }).clicked() {
                 a.push(Action::Open(entry.path.clone()));
+            }
+            if entry.script && ui.button("Edit").clicked() {
+                a.push(Action::Edit(entry.path.clone()));
             }
             match entry.kind {
                 Kind::App => {

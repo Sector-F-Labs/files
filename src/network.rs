@@ -307,6 +307,7 @@ pub fn entry(name: String, uri: String, icon: Vec<String>) -> Entry {
         mime: None,
         describe,
         executable: false,
+        script: false,
         trashed: None,
         remote: Some(crate::listing::Remote { uri, icon }),
     }
