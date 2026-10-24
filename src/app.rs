@@ -1453,7 +1453,7 @@ impl Files {
         }
         let titles: Vec<String> = self.tabs.iter().map(|t| Self::title_of(&t.location, &self.mounts)).collect();
         let mut action = None;
-        TitleBar::new("", style).custom(!self.config.system_title_bar).menu_bar(true).show(
+        TitleBar::new("", style).custom(!self.config.system_title_bar).menu_bar(true).span(span).show(
             ui,
             |ui| {
                 ui.menu_button("File", |ui| self.file_menu(ui));
