@@ -1398,8 +1398,6 @@ impl Files {
                             Key::A if m.command => Action::SelectAll,
                             Key::N if m.command && m.shift => Action::NewFolder,
                             Key::N if m.command => Action::NewWindow,
-                            Key::T if m.command && !m.shift => Action::Tab(TabAction::New),
-                            Key::W if m.command => Action::CloseTab,
                             Key::Q if m.command => Action::Quit,
                             Key::H if m.command => Action::ToggleHidden,
                             Key::L if m.command => Action::EditLocation,
@@ -3482,7 +3480,11 @@ impl eframe::App for Files {
         if self.picking.is_none()
             && let Some(action) = tabs::keys(&ctx, self.tabs.len(), self.tab)
         {
-            self.actions.push(Action::Tab(action));
+            // Ctrl+W on the last tab closes the window, as Close Tab does.
+            self.actions.push(match action {
+                TabAction::Close(_) => Action::CloseTab,
+                action => Action::Tab(action),
+            });
         }
         self.keys(&ctx);
 
