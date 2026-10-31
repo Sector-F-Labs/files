@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::listing::Sort;
+use crate::listing::{Sort, SortBy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum View {
@@ -21,6 +21,8 @@ pub struct Config {
     pub view: View,
     pub show_hidden: bool,
     pub sort: Sort,
+    /// The list view's columns after Name (which is always there).
+    pub list_columns: Vec<SortBy>,
     /// The desktop's title bar instead of Patina's.
     pub system_title_bar: bool,
     pub skin: String,
@@ -36,6 +38,7 @@ impl Default for Config {
             view: View::Icons,
             show_hidden: false,
             sort: Sort::default(),
+            list_columns: vec![SortBy::Size, SortBy::Modified, SortBy::Kind],
             system_title_bar: false,
             skin: patina::skin::DEFAULT_SKIN.into(),
             light_dark: "system".into(),

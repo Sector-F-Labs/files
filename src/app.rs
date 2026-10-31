@@ -1613,6 +1613,8 @@ impl Files {
             (SortBy::Name, "Sort by Name"),
             (SortBy::Size, "Sort by Size"),
             (SortBy::Modified, "Sort by Date Modified"),
+            (SortBy::Created, "Sort by Date Created"),
+            (SortBy::Accessed, "Sort by Date Last Opened"),
             (SortBy::Kind, "Sort by Kind"),
         ] {
             ui.radio_value(&mut sort.by, by, label);
@@ -2317,7 +2319,7 @@ impl Files {
 
     fn list_view(&mut self, ui: &mut Ui, visible: &[usize]) {
         let width = ui.available_width();
-        let columns = list_columns(width);
+        let columns = list_columns(width, &self.config.list_columns);
         self.columns = 1;
         // The header: click a column to sort by it, again to reverse.
         let (header, _) = ui.allocate_exact_size(vec2(width, ROW), Sense::hover());
@@ -2347,6 +2349,23 @@ impl Files {
             }
             x += w;
         }
+        ui.interact(header, Id::new(("list header", self.tab)), Sense::click()).context_menu(|ui| {
+            let mut chosen = self.config.list_columns.clone();
+            for (by, label) in OPTIONAL_COLUMNS {
+                let mut on = chosen.contains(&by);
+                if ui.checkbox(&mut on, label).changed() {
+                    if on {
+                        chosen.push(by);
+                    } else {
+                        chosen.retain(|c| *c != by);
+                    }
+                }
+            }
+            if chosen != self.config.list_columns {
+                self.config.list_columns = chosen;
+                self.config.save();
+            }
+        });
         ui.painter().hline(header.x_range(), header.bottom(), ui.visuals().widgets.noninteractive.bg_stroke);
 
         let px = (ROW_ICON * ui.ctx().pixels_per_point()).round() as u32;
@@ -2439,6 +2458,8 @@ impl Files {
                     _ => "—".into(),
                 },
                 SortBy::Modified => entry.modified.map(when).unwrap_or_default(),
+                SortBy::Created => entry.created.map(when).unwrap_or_default(),
+                SortBy::Accessed => entry.accessed.map(when).unwrap_or_default(),
                 SortBy::Kind => match &entry.trashed {
                     Some(item) => format!("From {}", item.original_parent.display()),
                     None => entry.describe.clone(),
@@ -3586,15 +3607,34 @@ fn load_skins() -> (Vec<Skin>, Vec<String>) {
     skin::load_all(skin::BUILT_IN, &skin::app_dir(APP).into_iter().collect::<Vec<_>>())
 }
 
+/// The columns the list can show after Name, in the order they appear.
+const OPTIONAL_COLUMNS: [(SortBy, &str); 5] = [
+    (SortBy::Size, "Size"),
+    (SortBy::Modified, "Date Modified"),
+    (SortBy::Created, "Date Created"),
+    (SortBy::Accessed, "Date Last Opened"),
+    (SortBy::Kind, "Kind"),
+];
+
 /// The list's columns: what each sorts by, its heading, width and whether
-/// it's right-aligned. Name takes what the others leave; Kind goes first
-/// when the window is narrow.
-fn list_columns(width: f32) -> Vec<(SortBy, &'static str, f32, bool)> {
-    let mut rest = vec![(SortBy::Size, "Size", 90.0, true), (SortBy::Modified, "Modified", 150.0, false)];
-    if width > 620.0 {
-        rest.push((SortBy::Kind, "Kind", 200.0, false));
+/// it's right-aligned. Name takes what the others leave; of those `wanted`,
+/// the last go first when the window is narrow.
+fn list_columns(width: f32, wanted: &[SortBy]) -> Vec<(SortBy, &'static str, f32, bool)> {
+    let mut rest: Vec<(SortBy, &'static str, f32, bool)> = Vec::new();
+    let mut used = 0.0;
+    for (by, _) in OPTIONAL_COLUMNS.iter().filter(|(by, _)| wanted.contains(by)) {
+        let (label, w, right) = match by {
+            SortBy::Size => ("Size", 90.0, true),
+            SortBy::Modified => ("Modified", 150.0, false),
+            SortBy::Created => ("Created", 150.0, false),
+            SortBy::Accessed => ("Last Opened", 150.0, false),
+            _ => ("Kind", 200.0, false),
+        };
+        if width - used - w > 180.0 {
+            rest.push((*by, label, w, right));
+            used += w;
+        }
     }
-    let used: f32 = rest.iter().map(|c| c.2).sum();
     let mut columns = vec![(SortBy::Name, "Name", (width - used).max(120.0), false)];
     columns.extend(rest);
     columns
@@ -3888,8 +3928,10 @@ mod tests {
 
     #[test]
     fn list_columns_fill_the_width() {
-        let columns = list_columns(900.0);
+        let wanted = Config::default().list_columns;
+        let columns = list_columns(900.0, &wanted);
         assert_eq!(columns.iter().map(|c| c.2).sum::<f32>(), 900.0);
-        assert_eq!(list_columns(500.0).len(), 3, "no Kind when narrow");
+        assert_eq!(list_columns(500.0, &wanted).len(), 3, "no Kind when narrow");
+        assert_eq!(list_columns(900.0, &[SortBy::Created]).len(), 2);
     }
 }

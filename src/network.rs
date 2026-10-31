@@ -303,6 +303,8 @@ pub fn entry(name: String, uri: String, icon: Vec<String>) -> Entry {
         kind: Kind::Folder,
         size: 0,
         modified: None,
+        created: None,
+        accessed: None,
         symlink: false,
         mime: None,
         describe,

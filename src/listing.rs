@@ -37,6 +37,9 @@ pub struct Entry {
     /// Bytes for a file; the number of items for a folder.
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// When it was made and last opened, where the filesystem says.
+    pub created: Option<SystemTime>,
+    pub accessed: Option<SystemTime>,
     pub hidden: bool,
     pub symlink: bool,
     /// The file's type, if its name says.
@@ -99,6 +102,7 @@ pub fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime
     let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let hidden = file_name.starts_with('.');
     let modified = meta.modified().ok();
+    let (created, accessed) = (meta.created().ok(), meta.accessed().ok());
     if meta.is_dir() {
         if patina_apps::is_app_folder(&path) {
             return Entry {
@@ -107,6 +111,8 @@ pub fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime
                 kind: Kind::App,
                 size: 0,
                 modified,
+                created,
+                accessed,
                 hidden,
                 symlink,
                 mime: None,
@@ -124,6 +130,8 @@ pub fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime
             kind: Kind::Folder,
             size,
             modified,
+            created,
+            accessed,
             hidden,
             symlink,
             mime: None,
@@ -148,6 +156,8 @@ pub fn entry(path: PathBuf, meta: &std::fs::Metadata, symlink: bool, mime: &Mime
         kind: Kind::File,
         size: meta.len(),
         modified,
+        created,
+        accessed,
         hidden,
         symlink,
         mime: ty,
@@ -184,6 +194,8 @@ fn read_trash(mime: &Mime) -> Result<Vec<Entry>, String> {
                     kind: Kind::File,
                     size: 0,
                     modified: None,
+                    created: None,
+                    accessed: None,
                     hidden: false,
                     symlink: false,
                     mime: None,
@@ -226,6 +238,8 @@ pub enum SortBy {
     Name,
     Size,
     Modified,
+    Created,
+    Accessed,
     Kind,
 }
 
@@ -249,6 +263,8 @@ pub fn sort(entries: &mut [Entry], sort: Sort) {
             SortBy::Name => Ordering::Equal,
             SortBy::Size => a.size.cmp(&b.size),
             SortBy::Modified => a.modified.cmp(&b.modified),
+            SortBy::Created => a.created.cmp(&b.created),
+            SortBy::Accessed => a.accessed.cmp(&b.accessed),
             SortBy::Kind => a.describe.cmp(&b.describe),
         };
         let by = by.then_with(|| natural(&a.name, &b.name));
