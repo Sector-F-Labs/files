@@ -33,6 +33,7 @@ use crate::preview::{self, Previews};
 use crate::properties::{self, Properties};
 use crate::uri;
 use crate::watch::Watcher;
+use crate::zfs;
 
 /// Files' skins folder is `~/.config/files/skins`.
 const APP: &str = "files";
@@ -318,6 +319,10 @@ pub struct Files {
     listed: Receiver<Listed>,
     /// Listings being read, and ones that changed again while they were.
     reading: HashSet<Location>,
+    /// The folder the status bar's ZFS facts are for, when they were read, and them.
+    zfs: Option<(PathBuf, std::time::Instant, Option<zfs::Info>)>,
+    zfs_reader: zfs::Reader,
+    zfs_asked: Option<(PathBuf, std::time::Instant)>,
     stale: HashSet<Location>,
     worker: ops::Worker,
     clip: Option<Clip>,
@@ -447,6 +452,9 @@ impl Files {
             listed_send,
             listed,
             reading: HashSet::new(),
+            zfs: None,
+            zfs_reader: zfs::Reader::new(),
+            zfs_asked: None,
             stale: HashSet::new(),
             worker: ops::Worker::new(ctx),
             clip: None,
@@ -518,7 +526,32 @@ impl Files {
     }
 
     /// Takes in finished listings, file changes and finished operations.
+    /// Reads the ZFS facts of the folder shown when it changes, and again
+    /// every few seconds, since the space moves.
+    fn poll_zfs(&mut self, ctx: &egui::Context) {
+        for (folder, info) in self.zfs_reader.poll() {
+            if self.current().folder() == Some(folder.as_path()) {
+                self.zfs = Some((folder, std::time::Instant::now(), info));
+            }
+        }
+        let Some(folder) = self.current().folder().map(Path::to_path_buf) else {
+            self.zfs = None;
+            return;
+        };
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+        let asked = self.zfs_asked.as_ref().filter(|(f, _)| *f == folder).map(|(_, at)| *at);
+        if asked.is_none_or(|at| at.elapsed() > EVERY) {
+            if asked.is_none() {
+                self.zfs = None;
+            }
+            self.zfs_asked = Some((folder.clone(), std::time::Instant::now()));
+            self.zfs_reader.start(folder, ctx);
+        }
+        ctx.request_repaint_after(EVERY);
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_zfs(ctx);
         self.icons.poll(ctx);
         self.previews.poll(ctx);
         let wanted = self.wanted_columns();
@@ -2051,6 +2084,10 @@ impl Files {
             ui.label(version.color(ui.visuals().weak_text_color()).small());
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 ui.label(count);
+                if let Some((_, _, Some(info))) = &self.zfs {
+                    ui.separator();
+                    zfs_label(ui, info);
+                }
                 if let Some((_, name)) = &self.connecting {
                     ui.separator();
                     ui.spinner();
@@ -3821,6 +3858,30 @@ fn quick_look_card(ui: &mut Ui, body: Rect, icon: Option<egui::TextureId>, name:
             ui.label(egui::RichText::new(format!("Can't preview it: {e}")).weak().small());
         }
     });
+}
+
+/// The dataset and its free space, with the rest on hover.
+fn zfs_label(ui: &mut Ui, info: &zfs::Info) {
+    let space = info.quota.unwrap_or(info.used + info.available);
+    let text =
+        format!("ZFS {} · {} of {} used", info.dataset, listing::human_size(info.used), listing::human_size(space));
+    let mut hover = vec![
+        format!("Dataset: {}", info.dataset),
+        format!(
+            "Used: {} (this dataset alone refers to {})",
+            listing::human_size(info.used),
+            listing::human_size(info.referenced)
+        ),
+        format!("Available: {}", listing::human_size(info.available)),
+    ];
+    if let Some(quota) = info.quota {
+        hover.push(format!("Quota: {}", listing::human_size(quota)));
+    }
+    hover.push(format!("Compression: {}, {}× saved", info.compression, info.ratio));
+    if info.recordsize > 0 {
+        hover.push(format!("Record size: {}", listing::human_size(info.recordsize)));
+    }
+    ui.label(text).on_hover_text(hover.join("\n"));
 }
 
 /// The toolbar's height: its buttons, and the path bar's crumbs in their middle.

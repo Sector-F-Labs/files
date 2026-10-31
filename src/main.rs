@@ -20,6 +20,7 @@ mod preview;
 mod properties;
 mod uri;
 mod watch;
+mod zfs;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

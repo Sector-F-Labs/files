@@ -50,6 +50,7 @@ lost). `pgrep -f` matches your own shell: find processes with `pgrep -x files`.
   display with its own queue and thread. Other apps' file drags are taken too, their list read
   as they come over; `Over` events give egui any drag over the window as pointer events and a
   payload, so drops stay egui's.
+- `src/zfs.rs`: the status bar's ZFS facts for the folder shown: the dataset from `/proc/self/mountinfo`, the numbers from `zfs get`, on a thread.
 - `src/places.rs`, `src/watch.rs` (notify), `src/uri.rs` (file URIs, the clipboard's form),
   `src/config.rs` (`~/.config/files/config.toml`), `src/glyphs.rs` (painted toolbar symbols).
 
