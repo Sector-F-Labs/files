@@ -21,6 +21,8 @@ pub struct Config {
     pub view: View,
     pub show_hidden: bool,
     pub sort: Sort,
+    /// Folders the user added to the sidebar.
+    pub favourites: Vec<PathBuf>,
     /// The list view's columns after Name (which is always there).
     pub list_columns: Vec<SortBy>,
     /// The desktop's title bar instead of Patina's.
@@ -38,6 +40,7 @@ impl Default for Config {
             view: View::Icons,
             show_hidden: false,
             sort: Sort::default(),
+            favourites: Vec::new(),
             list_columns: vec![SortBy::Size, SortBy::Modified, SortBy::Kind],
             system_title_bar: false,
             skin: patina::skin::DEFAULT_SKIN.into(),

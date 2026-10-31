@@ -18,6 +18,11 @@ impl Place {
     }
 }
 
+/// A folder the user added to the sidebar.
+pub fn favourite(path: &Path) -> Place {
+    Place::folder(name(path), path.to_path_buf(), &["folder-favorites", "folder"])
+}
+
 /// Home, Apps, the XDG user folders that exist, and the Trash.
 pub fn places() -> Vec<Place> {
     let Some(home) = dirs::home_dir() else { return Vec::new() };

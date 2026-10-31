@@ -222,6 +222,8 @@ impl Picking {
 enum Action {
     Open(PathBuf),
     OpenInNewTab(Location),
+    AddFavourite(PathBuf),
+    RemoveFavourite(PathBuf),
     ShowContents(PathBuf),
     Go(Location),
     Back,
@@ -806,6 +808,16 @@ impl Files {
                 self.open(&path, ctx);
             }
             Action::QuickLook => self.looking = !self.looking && self.looked_at().is_some(),
+            Action::AddFavourite(path) => {
+                if !self.config.favourites.contains(&path) {
+                    self.config.favourites.push(path);
+                    self.config.save();
+                }
+            }
+            Action::RemoveFavourite(path) => {
+                self.config.favourites.retain(|p| *p != path);
+                self.config.save();
+            }
             Action::OpenInNewTab(location) => {
                 self.tabs.insert(self.tab + 1, Tab::new(location.clone()));
                 self.load(location, ctx);
@@ -1939,7 +1951,11 @@ impl Files {
         let mut a = Vec::new();
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(6.0);
-            for (heading, list) in [("Places", &self.places), ("Disks", &self.disks)] {
+            let favourites: Vec<Place> = self.config.favourites.iter().map(|p| places::favourite(p)).collect();
+            for (heading, list) in [("Places", &self.places), ("Favourites", &favourites), ("Disks", &self.disks)] {
+                if list.is_empty() {
+                    continue;
+                }
                 ui.label(egui::RichText::new(heading).small().weak());
                 for place in list {
                     let icon = self.icons.get(&place.icon, px);
@@ -1951,6 +1967,18 @@ impl Files {
                         a.push(Action::OpenInNewTab(place.location.clone()));
                     }
                     drop_target(ui, &resp, &place.location, &mut a);
+                    if heading == "Favourites"
+                        && let Location::Folder(path) = &place.location
+                    {
+                        resp.context_menu(|ui| {
+                            if ui.button("Open in New Tab").clicked() {
+                                a.push(Action::OpenInNewTab(place.location.clone()));
+                            }
+                            if ui.button("Remove from Favourites").clicked() {
+                                a.push(Action::RemoveFavourite(path.clone()));
+                            }
+                        });
+                    }
                 }
                 ui.add_space(10.0);
             }
@@ -2813,6 +2841,13 @@ impl Files {
                     }
                     if ui.button("Open Terminal Here").clicked() {
                         a.push(Action::Terminal(entry.path.clone()));
+                    }
+                    if self.config.favourites.contains(&entry.path) {
+                        if ui.button("Remove from Favourites").clicked() {
+                            a.push(Action::RemoveFavourite(entry.path.clone()));
+                        }
+                    } else if ui.button("Add to Favourites").clicked() {
+                        a.push(Action::AddFavourite(entry.path.clone()));
                     }
                 }
                 Kind::File => {}
