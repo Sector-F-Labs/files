@@ -60,9 +60,10 @@ fn lists() -> Vec<PathBuf> {
 
 /// The desktop entry id the lists give `mime` first, that's installed.
 fn default_app(mime: &str) -> Option<String> {
-    lists().iter().filter_map(|list| std::fs::read_to_string(list).ok()).find_map(|text| {
-        defaults(&text, mime).into_iter().find(|id| find_entry(id).is_some())
-    })
+    lists()
+        .iter()
+        .filter_map(|list| std::fs::read_to_string(list).ok())
+        .find_map(|text| defaults(&text, mime).into_iter().find(|id| find_entry(id).is_some()))
 }
 
 /// The ids in a list's `[Default Applications]` for `mime`, in order.
@@ -176,7 +177,10 @@ mod tests {
         let path = Path::new("/home/me/run me.sh");
         assert_eq!(expand("gedit %U", path), ["gedit", "/home/me/run me.sh"]);
         assert_eq!(expand("kate -b %i", path), ["kate", "-b", "/home/me/run me.sh"]);
-        assert_eq!(expand(r#""/opt/My Editor/ed" --new-window %f"#, path), ["/opt/My Editor/ed", "--new-window", "/home/me/run me.sh"]);
+        assert_eq!(
+            expand(r#""/opt/My Editor/ed" --new-window %f"#, path),
+            ["/opt/My Editor/ed", "--new-window", "/home/me/run me.sh"]
+        );
         assert_eq!(expand("ed --percent=100%%", path), ["ed", "--percent=100%", "/home/me/run me.sh"]);
     }
 }

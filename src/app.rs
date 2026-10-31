@@ -344,6 +344,8 @@ pub struct Files {
     typed: (String, Instant),
     /// The icon view's columns, for the arrow keys.
     columns: usize,
+    /// The toolbar's middle, which the path bar centres on.
+    toolbar_middle: f32,
     /// Where the item area's content starts on screen, scrolled.
     origin: egui::Pos2,
     /// A drag on the background: where it started, in content coordinates,
@@ -462,6 +464,7 @@ impl Files {
             message: None,
             typed: (String::new(), Instant::now()),
             columns: 1,
+            toolbar_middle: 0.0,
             origin: egui::Pos2::ZERO,
             band: None,
             viewport: (0.0, 0.0),
@@ -1763,8 +1766,11 @@ impl Files {
         let has_entries = !tab.entries.is_empty();
         let mut a = Vec::new();
         ui.horizontal(|ui| {
+            ui.set_min_height(TOOLBAR_ROW);
             ui.spacing_mut().item_spacing.x = 2.0;
-            if glyph_button(ui, Glyph::Back, can_back, "Back (Alt+Left)").clicked() {
+            let back = glyph_button(ui, Glyph::Back, can_back, "Back (Alt+Left)");
+            self.toolbar_middle = back.rect.center().y;
+            if back.clicked() {
                 a.push(Action::Back);
             }
             if glyph_button(ui, Glyph::Forward, can_forward, "Forward (Alt+Right)").clicked() {
@@ -1813,7 +1819,7 @@ impl Files {
     }
 
     /// The folder's path as buttons, each a place to go or drop on; Ctrl+L
-    /// or a double click on the bar turns it into a field.
+    /// or a click on the bar beside the crumbs turns it into a field.
     fn path_bar(&mut self, ui: &mut Ui, a: &mut Vec<Action>) {
         if let Some(text) = &mut self.location_edit {
             let all = text.chars().count();
@@ -1850,38 +1856,48 @@ impl Files {
             return;
         }
         let crumbs = crumbs(&self.current().location, &self.mounts);
-        let bar = ui.available_rect_before_wrap();
+        let bar = Rect::from_center_size(
+            pos2(ui.cursor().min.x + ui.available_width() / 2.0, self.toolbar_middle),
+            vec2(ui.available_width(), TOOLBAR_ROW),
+        );
         let background = ui.interact(bar, ui.id().with("path-bar"), Sense::click());
-        if background.double_clicked() {
+        // Crumbs and the drop targets take their own clicks; anywhere else on
+        // the bar is the field.
+        if background.clicked() {
             a.push(Action::EditLocation);
         }
-        egui::ScrollArea::horizontal()
-            .stick_to_right(true)
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let last = crumbs.len().saturating_sub(1);
-                    for (i, (name, location)) in crumbs.into_iter().enumerate() {
-                        if i > 0 {
-                            let (rect, _) = ui.allocate_exact_size(vec2(14.0, 20.0), Sense::hover());
-                            glyphs::paint(
-                                ui.painter(),
-                                rect,
-                                Glyph::Separator,
-                                ui.visuals().widgets.inactive.fg_stroke,
-                            );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::top_down(Align::Min)), |ui| {
+            egui::ScrollArea::horizontal()
+                .content_margin(egui::Margin::ZERO)
+                .stick_to_right(true)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // As tall as the toolbar, so the crumbs sit in its middle.
+                        ui.set_min_height(TOOLBAR_ROW);
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let last = crumbs.len().saturating_sub(1);
+                        for (i, (name, location)) in crumbs.into_iter().enumerate() {
+                            if i > 0 {
+                                let (rect, _) = ui.allocate_exact_size(vec2(14.0, 20.0), Sense::hover());
+                                glyphs::paint(
+                                    ui.painter(),
+                                    rect,
+                                    Glyph::Separator,
+                                    ui.visuals().widgets.inactive.fg_stroke,
+                                );
+                            }
+                            let text =
+                                if i == last { egui::RichText::new(name).strong() } else { egui::RichText::new(name) };
+                            let resp = ui.add(egui::Button::new(text).frame(false).min_size(vec2(0.0, TOOLBAR_ROW)));
+                            if i != last && resp.clicked() {
+                                a.push(Action::Go(location.clone()));
+                            }
+                            drop_target(ui, &resp, &location, a);
                         }
-                        let text =
-                            if i == last { egui::RichText::new(name).strong() } else { egui::RichText::new(name) };
-                        let resp = ui.add(egui::Button::new(text).frame(false).min_size(vec2(0.0, 24.0)));
-                        if i != last && resp.clicked() {
-                            a.push(Action::Go(location.clone()));
-                        }
-                        drop_target(ui, &resp, &location, a);
-                    }
+                    });
                 });
-            });
+        });
     }
 
     fn sidebar(&mut self, ui: &mut Ui) {
@@ -3807,8 +3823,11 @@ fn quick_look_card(ui: &mut Ui, body: Rect, icon: Option<egui::TextureId>, name:
     });
 }
 
+/// The toolbar's height: its buttons, and the path bar's crumbs in their middle.
+const TOOLBAR_ROW: f32 = 26.0;
+
 fn glyph_button(ui: &mut Ui, glyph: Glyph, enabled: bool, hint: &str) -> Response {
-    let resp = ui.add_enabled(enabled, egui::Button::new("").min_size(vec2(28.0, 26.0))).on_hover_text(hint);
+    let resp = ui.add_enabled(enabled, egui::Button::new("").min_size(vec2(28.0, TOOLBAR_ROW))).on_hover_text(hint);
     let stroke = ui.visuals().widgets.style(&resp).fg_stroke;
     let stroke = if enabled { stroke } else { Stroke::new(stroke.width, ui.visuals().weak_text_color()) };
     glyphs::paint(ui.painter(), resp.rect, glyph, stroke);
@@ -3816,7 +3835,7 @@ fn glyph_button(ui: &mut Ui, glyph: Glyph, enabled: bool, hint: &str) -> Respons
 }
 
 fn glyph_toggle(ui: &mut Ui, glyph: Glyph, on: bool, hint: &str) -> Response {
-    let resp = ui.add(egui::Button::new("").selected(on).min_size(vec2(28.0, 26.0))).on_hover_text(hint);
+    let resp = ui.add(egui::Button::new("").selected(on).min_size(vec2(28.0, TOOLBAR_ROW))).on_hover_text(hint);
     let stroke = if on { ui.visuals().selection.stroke } else { ui.visuals().widgets.style(&resp).fg_stroke };
     glyphs::paint(ui.painter(), resp.rect, glyph, stroke);
     resp
