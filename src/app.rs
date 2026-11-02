@@ -2404,21 +2404,31 @@ impl Files {
         self.columns = 1;
         // The header: click a column to sort by it, again to reverse.
         let (header, _) = ui.allocate_exact_size(vec2(width, ROW), Sense::hover());
+        // Made first so the columns, made after, sit on top and get the clicks.
+        let header_resp = ui.interact(header, Id::new(("list header", self.tab)), Sense::click());
         let mut x = header.left();
         for (by, label, w, right) in &columns {
             let rect = Rect::from_min_size(pos2(x, header.top()), vec2(*w, ROW));
             let resp = ui.interact(rect, Id::new(("column", label)), Sense::click());
-            let mut text = label.to_string();
-            if self.config.sort.by == *by {
-                text.push_str(if self.config.sort.descending { " ▼" } else { " ▲" });
-            }
+            let sorted = self.config.sort.by == *by;
+            let gap = if sorted { 14.0 } else { 0.0 };
             let (align, at) = if *right {
-                (Align2::RIGHT_CENTER, rect.right_center() - vec2(8.0, 0.0))
+                (Align2::RIGHT_CENTER, rect.right_center() - vec2(8.0 + gap, 0.0))
             } else {
                 (Align2::LEFT_CENTER, rect.left_center() + vec2(8.0, 0.0))
             };
             let colour = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
-            ui.painter().text(at, align, text, egui::TextStyle::Small.resolve(ui.style()), colour);
+            let text_rect = ui.painter().text(at, align, *label, egui::TextStyle::Small.resolve(ui.style()), colour);
+            if sorted {
+                // Painted, not a glyph: the fonts have no triangles.
+                let c = pos2(text_rect.right() + 8.0, rect.center().y);
+                let (base, tip) = if self.config.sort.descending { (-2.0, 2.0) } else { (2.0, -2.0) };
+                ui.painter().add(egui::Shape::convex_polygon(
+                    vec![pos2(c.x - 3.5, c.y + base), pos2(c.x + 3.5, c.y + base), pos2(c.x, c.y + tip)],
+                    colour,
+                    egui::Stroke::NONE,
+                ));
+            }
             if resp.clicked() {
                 let mut sort = self.config.sort;
                 if sort.by == *by {
@@ -2430,7 +2440,7 @@ impl Files {
             }
             x += w;
         }
-        ui.interact(header, Id::new(("list header", self.tab)), Sense::click()).context_menu(|ui| {
+        header_resp.context_menu(|ui| {
             let mut chosen = self.config.list_columns.clone();
             for (by, label) in OPTIONAL_COLUMNS {
                 let mut on = chosen.contains(&by);
