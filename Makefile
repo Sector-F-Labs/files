@@ -12,7 +12,7 @@ PORTAL_SERVICE := org.freedesktop.impl.portal.desktop.patina
 PORTALDIR := /usr/share/xdg-desktop-portal
 SUDO ?= sudo
 
-.PHONY: help run build test check install uninstall default install-portal uninstall-portal app clean screenshots
+.PHONY: help run build test check install uninstall default install-portal uninstall-portal app clean screenshots icon
 
 help: ## Show this help
 	@echo "Usage: make <target>"
@@ -30,6 +30,9 @@ test: ## Run the tests
 
 screenshots: build ## Rewrite docs/screenshots on made-up data (docs/demo/)
 	docs/demo/screenshots.sh
+
+icon: ## docs/icon.png: the app icon at 120 px, for the README
+	cargo run -q --example render_icon -- 120 docs/icon.png
 
 check: test ## Run the tests and clippy
 	cargo clippy --all-targets -- -D warnings
