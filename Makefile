@@ -12,7 +12,7 @@ PORTAL_SERVICE := org.freedesktop.impl.portal.desktop.patina
 PORTALDIR := /usr/share/xdg-desktop-portal
 SUDO ?= sudo
 
-.PHONY: help run build test check install uninstall default install-portal uninstall-portal app clean
+.PHONY: help run build test check install uninstall default install-portal uninstall-portal app clean screenshots
 
 help: ## Show this help
 	@echo "Usage: make <target>"
@@ -27,6 +27,9 @@ build: ## Build a release binary
 
 test: ## Run the tests
 	cargo test
+
+screenshots: build ## Rewrite docs/screenshots on made-up data (docs/demo/)
+	docs/demo/screenshots.sh
 
 check: test ## Run the tests and clippy
 	cargo clippy --all-targets -- -D warnings

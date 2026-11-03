@@ -32,6 +32,8 @@ pub struct Config {
     pub light_dark: String,
     /// Where the last file was chosen for an app, to start the next there.
     pub chooser_folder: Option<PathBuf>,
+    /// The ZFS side panel is open.
+    pub zfs_panel: bool,
 }
 
 impl Default for Config {
@@ -46,6 +48,7 @@ impl Default for Config {
             skin: patina::skin::DEFAULT_SKIN.into(),
             light_dark: "system".into(),
             chooser_folder: None,
+            zfs_panel: false,
         }
     }
 }

@@ -1,0 +1,2 @@
+24 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+50 24 0:40 / /home/demo rw,xattr shared:2 - zfs tank/home rw,xattr

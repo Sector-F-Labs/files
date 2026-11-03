@@ -326,7 +326,6 @@ pub struct Files {
     zfs_reader: zfs::Reader,
     zfs_asked: Option<(PathBuf, std::time::Instant)>,
     /// The ZFS side panel, opened by a click on the status bar's dataset.
-    zfs_panel: bool,
     zfs_details: Option<(String, zfs::Details)>,
     zfs_detail_reader: zfs::DetailReader,
     zfs_detail_asked: Option<(String, std::time::Instant)>,
@@ -462,7 +461,6 @@ impl Files {
             zfs: None,
             zfs_reader: zfs::Reader::new(),
             zfs_asked: None,
-            zfs_panel: false,
             zfs_details: None,
             zfs_detail_reader: zfs::DetailReader::new(),
             zfs_detail_asked: None,
@@ -571,7 +569,7 @@ impl Files {
             }
         }
         let dataset = match &self.zfs {
-            Some((_, _, Some(info))) if self.zfs_panel => info.dataset.clone(),
+            Some((_, _, Some(info))) if self.config.zfs_panel => info.dataset.clone(),
             _ => {
                 self.zfs_detail_asked = None;
                 return;
@@ -2149,8 +2147,9 @@ impl Files {
                 ui.label(count);
                 if let Some((_, _, Some(info))) = &self.zfs {
                     ui.separator();
-                    if zfs_label(ui, info, self.zfs_panel).clicked() {
-                        self.zfs_panel = !self.zfs_panel;
+                    if zfs_label(ui, info, self.config.zfs_panel).clicked() {
+                        self.config.zfs_panel = !self.config.zfs_panel;
+                        self.config.save();
                     }
                 }
                 if let Some((_, name)) = &self.connecting {
@@ -3226,11 +3225,8 @@ impl Files {
             ui.label(egui::RichText::new("Space").small().weak());
             let space = info.quota.unwrap_or(info.used + info.available);
             if space > 0 {
-                ui.add(egui::ProgressBar::new(info.used as f32 / space as f32).text(format!(
-                    "{} of {}",
-                    size(info.used),
-                    size(space)
-                )));
+                ui.add(egui::ProgressBar::new(info.used as f32 / space as f32));
+                ui.label(egui::RichText::new(format!("{} of {}", size(info.used), size(space))).small());
             }
             let mut rows = vec![
                 ("Used".to_string(), size(info.used)),
@@ -3308,7 +3304,8 @@ impl Files {
             }
         });
         if close {
-            self.zfs_panel = false;
+            self.config.zfs_panel = false;
+            self.config.save();
         }
     }
 
@@ -3777,7 +3774,7 @@ impl eframe::App for Files {
             .default_size(180.0)
             .size_range(120.0..=320.0)
             .show(ui, |ui| self.sidebar(ui));
-        if self.zfs_panel && self.picking.is_none() && matches!(&self.zfs, Some((_, _, Some(_)))) {
+        if self.config.zfs_panel && self.picking.is_none() && matches!(&self.zfs, Some((_, _, Some(_)))) {
             egui::Panel::right("zfs")
                 .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 8)))
                 .default_size(300.0)

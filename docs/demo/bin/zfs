@@ -1,0 +1,24 @@
+#!/bin/bash
+# A stand-in for `zfs` that answers with made-up numbers, for screenshots.
+G=$((1<<30))
+case "$1" in
+get)
+  props="${@: -2:1}"; case "$props" in
+  used,*) printf 'used\t%s\navailable\t%s\nreferenced\t%s\nquota\t0\ncompression\tzstd\ncompressratio\t1.74x\nrecordsize\t131072\n' $((412*G)) $((1659*G)) $((371*G));;
+  *) printf 'mountpoint\t/home/demo\natime\toff\nsync\tstandard\ncopies\t1\nencryption\taes-256-gcm\ndedup\toff\nreadonly\toff\nprimarycache\tall\nlogicalused\t%s\nusedbysnapshots\t%s\nusedbydataset\t%s\nusedbychildren\t%s\ncreation\t1760000000\n' $((716*G)) $((38*G)) $((371*G)) $((3*G));;
+  esac;;
+list)
+  n=0
+  emit() { printf 'tank/home@%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(TZ=Etc/GMT-1 date -d "$4" +%s)"; }
+  emit autosnap_2026-08-01_00:00:04_monthly $((2100*1024*1024)) $((296*G)) "2026-08-01 00:00:04"
+  emit autosnap_2026-09-01_00:00:08_monthly $((3400*1024*1024)) $((318*G)) "2026-09-01 00:00:08"
+  emit before-upgrade $((612*1024*1024)) $((331*G)) "2026-09-18 21:14:30"
+  emit autosnap_2026-10-01_00:00:01_monthly $((5100*1024*1024)) $((344*G)) "2026-10-01 00:00:01"
+  emit autosnap_2026-10-19_00:00:03_weekly $((1800*1024*1024)) $((352*G)) "2026-10-19 00:00:03"
+  emit autosnap_2026-10-26_00:00:02_weekly $((2300*1024*1024)) $((359*G)) "2026-10-26 00:00:02"
+  emit autosnap_2026-10-31_00:00:05_daily $((410*1024*1024)) $((366*G)) "2026-10-31 00:00:05"
+  emit autosnap_2026-11-01_00:00:02_daily $((196*1024*1024)) $((368*G)) "2026-11-01 00:00:02"
+  emit autosnap_2026-11-02_00:00:04_daily $((884*1024*1024)) $((370*G)) "2026-11-02 00:00:04"
+  emit autosnap_2026-11-03_00:00:03_daily $((52*1024*1024)) $((371*G)) "2026-11-03 00:00:03"
+  emit autosnap_2026-11-03_08:00:02_hourly $((9*1024*1024)) $((371*G)) "2026-11-03 08:00:02";;
+esac

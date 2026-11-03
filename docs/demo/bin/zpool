@@ -1,0 +1,5 @@
+#!/bin/bash
+case "$1" in
+list) printf 'tank\tONLINE\t3984588800000\t2104000000000\t1880588800000\t14\t1.00x\n';;
+status) printf '  pool: tank\n state: ONLINE\n  scan: scrub repaired 0B in 01:12:40 with 0 errors on Sun Nov  1 03:12:44 2026\n';;
+esac

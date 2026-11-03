@@ -1,0 +1,3 @@
+#!/bin/bash
+# Answers the icon theme question, so the screenshots use Yaru prussian green.
+echo "'Yaru-prussiangreen'"
