@@ -325,6 +325,11 @@ pub struct Files {
     zfs: Option<(PathBuf, std::time::Instant, Option<zfs::Info>)>,
     zfs_reader: zfs::Reader,
     zfs_asked: Option<(PathBuf, std::time::Instant)>,
+    /// The ZFS side panel, opened by a click on the status bar's dataset.
+    zfs_panel: bool,
+    zfs_details: Option<(String, zfs::Details)>,
+    zfs_detail_reader: zfs::DetailReader,
+    zfs_detail_asked: Option<(String, std::time::Instant)>,
     stale: HashSet<Location>,
     worker: ops::Worker,
     clip: Option<Clip>,
@@ -457,6 +462,10 @@ impl Files {
             zfs: None,
             zfs_reader: zfs::Reader::new(),
             zfs_asked: None,
+            zfs_panel: false,
+            zfs_details: None,
+            zfs_detail_reader: zfs::DetailReader::new(),
+            zfs_detail_asked: None,
             stale: HashSet::new(),
             worker: ops::Worker::new(ctx),
             clip: None,
@@ -550,6 +559,32 @@ impl Files {
             self.zfs_reader.start(folder, ctx);
         }
         ctx.request_repaint_after(EVERY);
+        self.poll_zfs_details(ctx, EVERY);
+    }
+
+    /// The side panel's facts: read while it is open, for the dataset of the
+    /// folder shown, and again every few seconds.
+    fn poll_zfs_details(&mut self, ctx: &egui::Context, every: std::time::Duration) {
+        for (dataset, details) in self.zfs_detail_reader.poll() {
+            if matches!(&self.zfs, Some((_, _, Some(i))) if i.dataset == dataset) {
+                self.zfs_details = Some((dataset, details));
+            }
+        }
+        let dataset = match &self.zfs {
+            Some((_, _, Some(info))) if self.zfs_panel => info.dataset.clone(),
+            _ => {
+                self.zfs_detail_asked = None;
+                return;
+            }
+        };
+        let asked = self.zfs_detail_asked.as_ref().filter(|(d, _)| *d == dataset).map(|(_, at)| *at);
+        if asked.is_none_or(|at| at.elapsed() > every) {
+            if asked.is_none() {
+                self.zfs_details = None;
+            }
+            self.zfs_detail_asked = Some((dataset.clone(), std::time::Instant::now()));
+            self.zfs_detail_reader.start(dataset, ctx);
+        }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -2114,7 +2149,9 @@ impl Files {
                 ui.label(count);
                 if let Some((_, _, Some(info))) = &self.zfs {
                     ui.separator();
-                    zfs_label(ui, info);
+                    if zfs_label(ui, info, self.zfs_panel).clicked() {
+                        self.zfs_panel = !self.zfs_panel;
+                    }
                 }
                 if let Some((_, name)) = &self.connecting {
                     ui.separator();
@@ -3162,6 +3199,119 @@ impl Files {
     /// Properties (Ctrl+I): what's selected, or the folder, as Nautilus
     /// shows them: type, size and where it is, its times, and who may read,
     /// change or run it, which its owner can change here.
+    /// The right panel: the dataset's space, its pool and its snapshots.
+    fn zfs_side_panel(&mut self, ui: &mut Ui) {
+        let Some((_, _, Some(info))) = &self.zfs else { return };
+        let details = self.zfs_details.as_ref().map(|(_, d)| d);
+        let size = listing::human_size;
+        let mut close = false;
+        ui.horizontal(|ui| {
+            ui.heading("ZFS");
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                close = glyph_button(ui, Glyph::Close, true, "Close").clicked();
+            });
+        });
+        ui.label(egui::RichText::new(&info.dataset).strong());
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let grid = |ui: &mut Ui, id: &str, rows: Vec<(String, String)>| {
+                egui::Grid::new(id).num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
+                    for (k, v) in rows {
+                        ui.label(egui::RichText::new(k).weak());
+                        ui.add(egui::Label::new(v).wrap());
+                        ui.end_row();
+                    }
+                });
+            };
+            ui.label(egui::RichText::new("Space").small().weak());
+            let space = info.quota.unwrap_or(info.used + info.available);
+            if space > 0 {
+                ui.add(egui::ProgressBar::new(info.used as f32 / space as f32).text(format!(
+                    "{} of {}",
+                    size(info.used),
+                    size(space)
+                )));
+            }
+            let mut rows = vec![
+                ("Used".to_string(), size(info.used)),
+                ("Available".to_string(), size(info.available)),
+                ("Referenced".to_string(), size(info.referenced)),
+            ];
+            if let Some(quota) = info.quota {
+                rows.push(("Quota".into(), size(quota)));
+            }
+            if let Some(d) = details {
+                rows.push(("In snapshots".into(), size(d.by_snapshots)));
+                rows.push(("In children".into(), size(d.by_children)));
+                if d.logical > 0 {
+                    rows.push(("Before compression".into(), size(d.logical)));
+                }
+            }
+            rows.push(("Compression".into(), format!("{}, {}× saved", info.compression, info.ratio)));
+            if info.recordsize > 0 {
+                rows.push(("Record size".into(), size(info.recordsize)));
+            }
+            grid(ui, "zfs_space", rows);
+
+            let Some(d) = details else {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Reading…");
+                });
+                return;
+            };
+            if let Some(pool) = &d.pool {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(format!("Pool {}", pool.name)).small().weak());
+                let mut rows = vec![
+                    ("Health".to_string(), pool.health.clone()),
+                    ("Size".into(), size(pool.size)),
+                    ("Allocated".into(), size(pool.allocated)),
+                    ("Free".into(), size(pool.free)),
+                ];
+                if let Some(f) = pool.fragmentation {
+                    rows.push(("Fragmentation".into(), format!("{f}%")));
+                }
+                rows.push(("Dedup ratio".into(), format!("{}×", pool.dedup)));
+                if let Some(scan) = &d.scan {
+                    rows.push(("Scan".into(), scan.clone()));
+                }
+                grid(ui, "zfs_pool", rows);
+            }
+            if !d.properties.is_empty() {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Properties").small().weak());
+                grid(ui, "zfs_props", d.properties.clone());
+            }
+            ui.add_space(10.0);
+            let n = d.snapshots.len();
+            ui.label(egui::RichText::new(format!("Snapshots ({n})")).small().weak());
+            if n == 0 {
+                ui.label(egui::RichText::new("None").weak());
+            }
+            // Newest first.
+            for snap in d.snapshots.iter().rev() {
+                let created = std::time::UNIX_EPOCH + Duration::from_secs(snap.created.max(0) as u64);
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(egui::RichText::new(&snap.name).strong()).wrap());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {} unique · {} referenced",
+                        date_time(created),
+                        size(snap.used),
+                        size(snap.referenced)
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+        });
+        if close {
+            self.zfs_panel = false;
+        }
+    }
+
     fn properties_window(&mut self, ctx: &egui::Context) {
         let Some(properties) = &self.properties else { return };
         let info = properties.info().clone();
@@ -3627,6 +3777,13 @@ impl eframe::App for Files {
             .default_size(180.0)
             .size_range(120.0..=320.0)
             .show(ui, |ui| self.sidebar(ui));
+        if self.zfs_panel && self.picking.is_none() && matches!(&self.zfs, Some((_, _, Some(_)))) {
+            egui::Panel::right("zfs")
+                .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 8)))
+                .default_size(300.0)
+                .size_range(220.0..=520.0)
+                .show(ui, |ui| self.zfs_side_panel(ui));
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(4)))
             .show(ui, |ui| self.items(ui));
@@ -3905,8 +4062,8 @@ fn quick_look_card(ui: &mut Ui, body: Rect, icon: Option<egui::TextureId>, name:
     });
 }
 
-/// The dataset and its free space, with the rest on hover.
-fn zfs_label(ui: &mut Ui, info: &zfs::Info) {
+/// The dataset and its free space, with the rest on hover; a click opens the side panel.
+fn zfs_label(ui: &mut Ui, info: &zfs::Info, open: bool) -> Response {
     let space = info.quota.unwrap_or(info.used + info.available);
     let text =
         format!("ZFS {} · {} of {} used", info.dataset, listing::human_size(info.used), listing::human_size(space));
@@ -3926,7 +4083,10 @@ fn zfs_label(ui: &mut Ui, info: &zfs::Info) {
     if info.recordsize > 0 {
         hover.push(format!("Record size: {}", listing::human_size(info.recordsize)));
     }
-    ui.label(text).on_hover_text(hover.join("\n"));
+    hover.push(format!("Click to {} the ZFS panel", if open { "close" } else { "open" }));
+    ui.add(egui::Label::new(text).sense(egui::Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(hover.join("\n"))
 }
 
 /// The toolbar's height: its buttons, and the path bar's crumbs in their middle.

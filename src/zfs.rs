@@ -126,6 +126,164 @@ fn parse(dataset: &str, text: &str) -> Option<Info> {
     })
 }
 
+/// What the side panel shows about a dataset: its pool, its snapshots and
+/// more of its properties. Read only while the panel is open.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Details {
+    pub pool: Option<Pool>,
+    /// Oldest first.
+    pub snapshots: Vec<Snapshot>,
+    /// Label and value, in the order to show them.
+    pub properties: Vec<(String, String)>,
+    pub by_snapshots: u64,
+    pub by_dataset: u64,
+    pub by_children: u64,
+    pub logical: u64,
+    /// The last scrub or resilver, as `zpool status` words it.
+    pub scan: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pool {
+    pub name: String,
+    pub health: String,
+    pub size: u64,
+    pub allocated: u64,
+    pub free: u64,
+    /// Percent, if the pool reports it.
+    pub fragmentation: Option<u64>,
+    pub dedup: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    /// After the `@`.
+    pub name: String,
+    pub used: u64,
+    pub referenced: u64,
+    /// Seconds since the epoch.
+    pub created: i64,
+}
+
+pub struct DetailReader {
+    send: Sender<(String, Details)>,
+    done: Receiver<(String, Details)>,
+}
+
+impl DetailReader {
+    pub fn new() -> Self {
+        let (send, done) = channel();
+        DetailReader { send, done }
+    }
+
+    pub fn start(&self, dataset: String, ctx: &egui::Context) {
+        let (send, ctx) = (self.send.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let details = read_details(&dataset);
+            let _ = send.send((dataset, details));
+            ctx.request_repaint();
+        });
+    }
+
+    pub fn poll(&self) -> Vec<(String, Details)> {
+        self.done.try_iter().collect()
+    }
+}
+
+fn run(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn read_details(dataset: &str) -> Details {
+    let pool_name = dataset.split('/').next().unwrap_or(dataset);
+    let props = run(
+        "zfs",
+        &[
+            "get",
+            "-Hp",
+            "-o",
+            "property,value",
+            "mountpoint,atime,sync,copies,encryption,dedup,readonly,primarycache,logicalused,\
+             usedbysnapshots,usedbydataset,usedbychildren,creation",
+            dataset,
+        ],
+    )
+    .unwrap_or_default();
+    let snapshots = run(
+        "zfs",
+        &["list", "-Hp", "-t", "snapshot", "-d", "1", "-o", "name,used,referenced,creation", "-s", "creation", dataset],
+    )
+    .map(|t| parse_snapshots(&t))
+    .unwrap_or_default();
+    let pool =
+        run("zpool", &["list", "-Hp", "-o", "name,health,size,allocated,free,fragmentation,dedupratio", pool_name])
+            .and_then(|t| parse_pool(&t));
+    let scan = run("zpool", &["status", pool_name])
+        .and_then(|t| t.lines().find_map(|l| l.trim().strip_prefix("scan:").map(|s| s.trim().to_string())));
+    parse_details(&props, snapshots, pool, scan)
+}
+
+fn parse_details(props: &str, snapshots: Vec<Snapshot>, pool: Option<Pool>, scan: Option<String>) -> Details {
+    let get = |name: &str| {
+        props.lines().find_map(|l| l.split_once('\t').filter(|(p, _)| *p == name).map(|(_, v)| v.trim().to_string()))
+    };
+    let number = |name: &str| get(name).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let mut properties = Vec::new();
+    for (label, name) in [
+        ("Mount point", "mountpoint"),
+        ("Encryption", "encryption"),
+        ("Deduplication", "dedup"),
+        ("Copies", "copies"),
+        ("Sync", "sync"),
+        ("Access times", "atime"),
+        ("Read only", "readonly"),
+        ("Primary cache", "primarycache"),
+    ] {
+        if let Some(v) = get(name) {
+            properties.push((label.to_string(), v));
+        }
+    }
+    Details {
+        pool,
+        snapshots,
+        properties,
+        by_snapshots: number("usedbysnapshots"),
+        by_dataset: number("usedbydataset"),
+        by_children: number("usedbychildren"),
+        logical: number("logicalused"),
+        scan,
+    }
+}
+
+fn parse_snapshots(text: &str) -> Vec<Snapshot> {
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let name = f.next()?.split_once('@')?.1.to_string();
+            Some(Snapshot {
+                name,
+                used: f.next()?.parse().ok()?,
+                referenced: f.next()?.parse().ok()?,
+                created: f.next()?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn parse_pool(text: &str) -> Option<Pool> {
+    let mut f = text.lines().next()?.split('\t');
+    Some(Pool {
+        name: f.next()?.to_string(),
+        health: f.next()?.to_string(),
+        size: f.next()?.parse().ok()?,
+        allocated: f.next()?.parse().ok()?,
+        free: f.next()?.parse().ok()?,
+        fragmentation: f.next()?.parse().ok(),
+        dedup: f.next()?.trim_end_matches('x').to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +311,17 @@ mod tests {
         let info = parse("tank/x", text).unwrap();
         assert_eq!((info.used, info.quota, info.ratio.as_str()), (100, None, "2.32"));
         assert!(parse("tank/x", "used\t1\n").is_none());
+    }
+
+    #[test]
+    fn snapshots_and_pool_are_read() {
+        let snaps = parse_snapshots("tank@a\t10\t20\t1000\ntank@b\t0\t30\t2000\n");
+        assert_eq!(snaps.len(), 2);
+        assert_eq!((snaps[1].name.as_str(), snaps[1].created), ("b", 2000));
+        let pool = parse_pool("tank\tONLINE\t100\t60\t40\t43\t1.13x\n").unwrap();
+        assert_eq!((pool.fragmentation, pool.dedup.as_str()), (Some(43), "1.13"));
+        assert_eq!(parse_pool("tank\tONLINE\t100\t60\t40\t-\t1.00x\n").unwrap().fragmentation, None);
+        let d = parse_details("usedbysnapshots\t5\ndedup\toff\n", snaps, None, None);
+        assert_eq!((d.by_snapshots, d.properties.len()), (5, 1));
     }
 }

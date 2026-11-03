@@ -15,6 +15,8 @@ pub enum Glyph {
     Columns,
     /// Unmounting a share.
     Eject,
+    /// Closing a panel.
+    Close,
 }
 
 pub fn paint(painter: &Painter, rect: Rect, glyph: Glyph, stroke: Stroke) {
@@ -29,6 +31,11 @@ pub fn paint(painter: &Painter, rect: Rect, glyph: Glyph, stroke: Stroke) {
         Glyph::Forward | Glyph::Separator => {
             let s = if matches!(glyph, Glyph::Separator) { s * 0.7 } else { s };
             chevron([pos2(c.x - s * 0.5, c.y - s), pos2(c.x + s * 0.5, c.y), pos2(c.x - s * 0.5, c.y + s)])
+        }
+        Glyph::Close => {
+            let s = s * 0.8;
+            painter.line_segment([pos2(c.x - s, c.y - s), pos2(c.x + s, c.y + s)], stroke);
+            painter.line_segment([pos2(c.x - s, c.y + s), pos2(c.x + s, c.y - s)], stroke);
         }
         Glyph::Up => chevron([pos2(c.x - s, c.y + s * 0.5), pos2(c.x, c.y - s * 0.5), pos2(c.x + s, c.y + s * 0.5)]),
         Glyph::Icons => {
