@@ -1,3 +1,5 @@
+> **Moved.** This project now lives in [patina-desktop](https://github.com/Sector-F-Labs/patina-desktop/tree/master/files), in the `files/` folder, with its history. This repository is no longer updated.
+
 # Files
 
 ![Files' icon](docs/icon.png)
